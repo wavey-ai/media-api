@@ -1,0 +1,60 @@
+[package]
+name = "media-api"
+authors = ["Jamie Brough <jamie@wavey.ai>"]
+version = "0.1.0"
+edition = "2021"
+autobenches = false
+
+[dependencies]
+# Server framework from web-services
+web-service = { git = "https://github.com/wavey-ai/web-services.git", branch = "feature/optional-http-pack" }
+tls-helpers = { git = "https://github.com/wavey-ai/tls-helpers.git" }
+
+# Audio decoding
+soundkit-decoder = { git = "https://github.com/wavey-ai/soundkit.git" }
+soundkit = { git = "https://github.com/wavey-ai/soundkit.git" }
+frame-header = { git = "https://github.com/wavey-ai/frame-header.git" }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures-util = "0.3"
+
+# HTTP types
+http = "1"
+bytes = "1"
+hyper = { version = "1.6", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Environment
+dotenvy = "0.15"
+structopt = "0.3"
+
+# Load test dependencies
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "json"] }
+portpicker = "0.1"
+base64 = "0.22"
+
+[dev-dependencies]
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+
+[[bin]]
+name = "media-api"
+path = "src/main.rs"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[[bin]]
+name = "load_test"
+path = "benches/load_test.rs"
