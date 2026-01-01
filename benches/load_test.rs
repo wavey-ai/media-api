@@ -12,7 +12,7 @@ use media_api::{MediaApiConfig, MediaRouter};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex, Semaphore};
@@ -22,7 +22,7 @@ use web_service::h2::Http2Server;
 // Configuration
 // =============================================================================
 
-const INITIAL_CONCURRENCY: usize = 10;
+const INITIAL_CONCURRENCY: usize = 1;
 const MAX_CONCURRENCY: usize = 200;
 const CONCURRENCY_RAMP_STEP: usize = 10;
 const CONCURRENCY_RAMP_INTERVAL_MS: u64 = 2000;
@@ -37,6 +37,7 @@ const LATENCY_EMERGENCY_MS: f64 = 2000.0;
 const THROUGHPUT_DROP_WARNING_PCT: f64 = 20.0;
 const THROUGHPUT_DROP_CRITICAL_PCT: f64 = 40.0;
 const THROUGHPUT_DROP_EMERGENCY_PCT: f64 = 60.0;
+const MAX_EMERGENCY_WARNINGS_BEFORE_ABORT: usize = 3;
 
 // =============================================================================
 // Autoscaling Notification Types
@@ -408,17 +409,20 @@ struct FormatStats {
     total_latency_us: AtomicU64,
     min_latency_us: AtomicU64,
     max_latency_us: AtomicU64,
+    max_error_free_concurrency: AtomicUsize,
+    first_error_concurrency: AtomicUsize,
 }
 
 impl FormatStats {
     fn new() -> Self {
         Self {
             min_latency_us: AtomicU64::new(u64::MAX),
+            first_error_concurrency: AtomicUsize::new(usize::MAX),
             ..Default::default()
         }
     }
 
-    fn record_success(&self, input_bytes: usize, output_bytes: usize, audio_seconds: f64, latency: Duration) {
+    fn record_success(&self, input_bytes: usize, output_bytes: usize, audio_seconds: f64, latency: Duration, current_concurrency: usize) {
         self.requests.fetch_add(1, Ordering::Relaxed);
         self.successes.fetch_add(1, Ordering::Relaxed);
         self.total_input_bytes.fetch_add(input_bytes as u64, Ordering::Relaxed);
@@ -429,11 +433,31 @@ impl FormatStats {
         self.total_latency_us.fetch_add(latency_us, Ordering::Relaxed);
         self.min_latency_us.fetch_min(latency_us, Ordering::Relaxed);
         self.max_latency_us.fetch_max(latency_us, Ordering::Relaxed);
+
+        // Update max error-free concurrency if no errors have occurred yet
+        if self.first_error_concurrency.load(Ordering::Relaxed) == usize::MAX {
+            self.max_error_free_concurrency.fetch_max(current_concurrency, Ordering::Relaxed);
+        }
     }
 
-    fn record_failure(&self) {
+    fn record_failure(&self, current_concurrency: usize) {
         self.requests.fetch_add(1, Ordering::Relaxed);
         self.failures.fetch_add(1, Ordering::Relaxed);
+        // Record the concurrency level of first error
+        self.first_error_concurrency.fetch_min(current_concurrency, Ordering::Relaxed);
+    }
+
+    fn max_error_free_concurrency(&self) -> usize {
+        let first_error = self.first_error_concurrency.load(Ordering::Relaxed);
+        if first_error == usize::MAX {
+            // No errors occurred, return the max concurrency we tracked
+            self.max_error_free_concurrency.load(Ordering::Relaxed)
+        } else {
+            // Errors occurred, max error-free is one less than first error concurrency
+            // or the max we tracked before errors, whichever is smaller
+            let max_tracked = self.max_error_free_concurrency.load(Ordering::Relaxed);
+            max_tracked.min(first_error.saturating_sub(1))
+        }
     }
 }
 
@@ -452,6 +476,7 @@ struct FormatResult {
     input_mb: f64,
     output_mb: f64,
     throughput_mbps: f64,
+    max_error_free_concurrency: usize,
 }
 
 // =============================================================================
@@ -550,6 +575,7 @@ async fn run_format_benchmark_with_autoscale(
     monitor: Arc<Mutex<AutoscaleMonitor>>,
     current_concurrency: Arc<AtomicUsize>,
     active_requests: Arc<AtomicUsize>,
+    abort_flag: Arc<AtomicBool>,
 ) -> FormatResult {
     let stats = Arc::new(FormatStats::new());
 
@@ -560,8 +586,9 @@ async fn run_format_benchmark_with_autoscale(
         let _ = decode_request(client, port, file.data.clone()).await;
     }
 
-    // Reset concurrency for actual test
+    // Reset concurrency and active requests for actual test
     current_concurrency.store(INITIAL_CONCURRENCY, Ordering::SeqCst);
+    active_requests.store(0, Ordering::SeqCst);
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENCY));
 
     // Start with initial permits
@@ -587,6 +614,11 @@ async fn run_format_benchmark_with_autoscale(
     });
 
     for file in files.iter() {
+        // Check if we should abort
+        if abort_flag.load(Ordering::SeqCst) {
+            break;
+        }
+
         // Wait for permit based on current allowed concurrency
         loop {
             let allowed = available_permits.load(Ordering::SeqCst);
@@ -594,7 +626,14 @@ async fn run_format_benchmark_with_autoscale(
             if active < allowed {
                 break;
             }
+            if abort_flag.load(Ordering::SeqCst) {
+                break;
+            }
             tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        if abort_flag.load(Ordering::SeqCst) {
+            break;
         }
 
         let permit = semaphore.clone().acquire_owned().await.unwrap();
@@ -606,10 +645,13 @@ async fn run_format_benchmark_with_autoscale(
         let monitor = monitor.clone();
         let format = format.to_string();
         let active_req = active_requests.clone();
+        let concurrency_tracker = current_concurrency.clone();
 
         let handle = tokio::spawn(async move {
             let req_start = Instant::now();
             let input_bytes = file.data.len();
+            // Capture concurrency at request start
+            let req_concurrency = concurrency_tracker.load(Ordering::SeqCst);
 
             let result = decode_request(&client, port, file.data).await;
             let latency = req_start.elapsed();
@@ -617,12 +659,12 @@ async fn run_format_benchmark_with_autoscale(
 
             match result {
                 Ok(output) => {
-                    stats.record_success(input_bytes, output.len(), file.estimated_duration, latency);
+                    stats.record_success(input_bytes, output.len(), file.estimated_duration, latency, req_concurrency);
                     let mut mon = monitor.lock().await;
                     mon.record_sample(&format, latency_ms, file.estimated_duration, true);
                 }
                 Err(_) => {
-                    stats.record_failure();
+                    stats.record_failure(req_concurrency);
                     let mut mon = monitor.lock().await;
                     mon.record_sample(&format, latency_ms, 0.0, false);
                 }
@@ -635,11 +677,23 @@ async fn run_format_benchmark_with_autoscale(
         handles.push(handle);
     }
 
-    for handle in handles {
-        let _ = handle.await;
+    // If aborted, cancel all in-flight requests; otherwise wait for completion
+    if abort_flag.load(Ordering::SeqCst) {
+        for handle in handles {
+            handle.abort();
+        }
+    } else {
+        for handle in handles {
+            let _ = handle.await;
+        }
     }
 
     ramp_handle.abort();
+    // Wait for active requests to complete or timeout
+    let drain_start = Instant::now();
+    while active_requests.load(Ordering::SeqCst) > 0 && drain_start.elapsed() < Duration::from_secs(2) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     let wallclock = start.elapsed();
     let requests = stats.requests.load(Ordering::Relaxed);
@@ -684,6 +738,7 @@ async fn run_format_benchmark_with_autoscale(
         } else {
             0.0
         },
+        max_error_free_concurrency: stats.max_error_free_concurrency(),
     }
 }
 
@@ -727,8 +782,6 @@ async fn main() {
         "linear16_48",
         "linear32",
         "linear32_48",
-        "g729",
-        "es",
     ];
 
     // Load test data
@@ -761,13 +814,15 @@ async fn main() {
     println!("  Server running on port {}", port);
     println!();
 
-    // Build HTTP client
+    // Build HTTP client with timeouts
     use std::net::SocketAddr;
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
     let client = reqwest::Client::builder()
         .resolve("local.wavey.ai", addr)
         .pool_max_idle_per_host(MAX_CONCURRENCY)
         .pool_idle_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(5))
         .build()
         .expect("Failed to build client");
 
@@ -775,11 +830,28 @@ async fn main() {
     let (notification_tx, mut notification_rx) = mpsc::unbounded_channel::<AutoscaleNotification>();
     let all_notifications: Arc<Mutex<Vec<AutoscaleNotification>>> = Arc::new(Mutex::new(Vec::new()));
 
+    // Track emergency count per format for early abort
+    let emergency_counts: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
+    let current_format_abort: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+
     // Spawn notification collector
     let notifications_clone = all_notifications.clone();
+    let emergency_counts_clone = emergency_counts.clone();
+    let abort_flag_clone = current_format_abort.clone();
     let notification_handler = tokio::spawn(async move {
         while let Some(notification) = notification_rx.recv().await {
             println!("  🚨 AUTOSCALE: {}", notification.summary());
+
+            // Track emergency count and trigger abort if threshold exceeded
+            if notification.urgency == Urgency::Emergency {
+                let mut counts = emergency_counts_clone.lock().await;
+                let count = counts.entry(notification.format.clone()).or_insert(0);
+                *count += 1;
+                if *count >= MAX_EMERGENCY_WARNINGS_BEFORE_ABORT {
+                    abort_flag_clone.store(true, Ordering::SeqCst);
+                }
+            }
+
             notifications_clone.lock().await.push(notification);
         }
     });
@@ -808,8 +880,9 @@ async fn main() {
             print!("Testing {:12}... ", format);
             std::io::Write::flush(&mut std::io::stdout()).ok();
 
-            // Reset concurrency for each format
+            // Reset concurrency and abort flag for each format
             current_concurrency.store(INITIAL_CONCURRENCY, Ordering::SeqCst);
+            current_format_abort.store(false, Ordering::SeqCst);
 
             let result = run_format_benchmark_with_autoscale(
                 &client,
@@ -819,23 +892,30 @@ async fn main() {
                 monitor.clone(),
                 current_concurrency.clone(),
                 active_requests.clone(),
+                current_format_abort.clone(),
             )
             .await;
 
             let final_concurrency = current_concurrency.load(Ordering::SeqCst);
+            let was_aborted = current_format_abort.load(Ordering::SeqCst);
+            let abort_indicator = if was_aborted { " [ABORTED]" } else { "" };
             println!(
-                "{:6.1}x realtime | {:5.1}ms avg | {}/{} ok | max_conc={}",
+                "{:6.1}x realtime | {:5.1}ms avg | {}/{} ok | max_conc={} | max_err_free={}{}",
                 result.audio_seconds_per_second,
                 result.avg_latency_ms,
                 result.successes,
                 result.requests,
-                final_concurrency
+                final_concurrency,
+                result.max_error_free_concurrency,
+                abort_indicator
             );
             results.push(result);
         }
     }
 
     // Close notification channel and wait for handler
+    // Must drop monitor first since it holds a clone of notification_tx
+    drop(monitor);
     drop(notification_tx);
     let _ = notification_handler.await;
 
@@ -843,15 +923,15 @@ async fn main() {
 
     // Print detailed results
     println!();
-    println!("╔══════════════════════════════════════════════════════════════════════════════════════════════════════════╗");
-    println!("║                                         DETAILED RESULTS                                                 ║");
-    println!("╠══════════════╦═══════════╦═══════════╦═══════════╦═══════════════════════════╦═══════════════════════════╣");
-    println!("║    Format    ║  Audio/s  ║  Success  ║  Failure  ║  Latency (min/avg/max)    ║  Throughput (MB/s)        ║");
-    println!("╠══════════════╬═══════════╬═══════════╬═══════════╬═══════════════════════════╬═══════════════════════════╣");
+    println!("╔═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗");
+    println!("║                                              DETAILED RESULTS                                                             ║");
+    println!("╠══════════════╦═══════════╦═══════════╦═══════════╦═══════════════════════════╦════════════════════╦══════════════════════╣");
+    println!("║    Format    ║  Audio/s  ║  Success  ║  Failure  ║  Latency (min/avg/max)    ║  Throughput (MB/s) ║  Max Err-Free Conc   ║");
+    println!("╠══════════════╬═══════════╬═══════════╬═══════════╬═══════════════════════════╬════════════════════╬══════════════════════╣");
 
     for r in &results {
         println!(
-            "║ {:12} ║ {:7.1}x  ║ {:7}   ║ {:7}   ║ {:5.0}/{:6.1}/{:6.0} ms   ║ {:8.2} MB/s              ║",
+            "║ {:12} ║ {:7.1}x  ║ {:7}   ║ {:7}   ║ {:5.0}/{:6.1}/{:6.0} ms   ║ {:8.2} MB/s       ║ {:>20} ║",
             r.format,
             r.audio_seconds_per_second,
             r.successes,
@@ -860,10 +940,11 @@ async fn main() {
             r.avg_latency_ms,
             r.max_latency_ms,
             r.throughput_mbps,
+            r.max_error_free_concurrency,
         );
     }
 
-    println!("╚══════════════╩═══════════╩═══════════╩═══════════╩═══════════════════════════╩═══════════════════════════╝");
+    println!("╚══════════════╩═══════════╩═══════════╩═══════════╩═══════════════════════════╩════════════════════╩══════════════════════╝");
 
     // Summary
     let total_audio: f64 = results.iter().map(|r| r.total_audio_seconds).sum();
