@@ -45,10 +45,10 @@ fn testdata_path(file: &str) -> PathBuf {
         .join(file)
 }
 
-fn golden_path(file: &str) -> PathBuf {
+fn out_path(file: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("testdata")
-        .join("golden")
+        .join("out")
         .join(file)
 }
 
@@ -419,7 +419,7 @@ async fn test_http_decode_all_formats() {
     ];
 
     let mut results: Vec<(&str, DecodeResult)> = Vec::new();
-    let out_dir = golden_path("");
+    let out_dir = out_path("");
     fs::create_dir_all(&out_dir).ok();
 
     for (name, path) in formats {
@@ -438,7 +438,7 @@ async fn test_http_decode_all_formats() {
                     continue;
                 }
 
-                // Write golden output
+                // Write output
                 let output_path = out_dir.join(format!("http_{}.s16le", name));
                 let mut f = fs::File::create(&output_path).unwrap();
                 f.write_all(&pcm_data).unwrap();
@@ -470,7 +470,7 @@ async fn test_http11_chunked_decode() {
     ];
 
     let mut results: Vec<(&str, DecodeResult)> = Vec::new();
-    let out_dir = golden_path("");
+    let out_dir = out_path("");
     fs::create_dir_all(&out_dir).ok();
 
     for (name, path) in formats {
@@ -497,7 +497,7 @@ async fn test_http11_chunked_decode() {
                     continue;
                 }
 
-                // Write golden output
+                // Write output
                 let output_path = out_dir.join(format!("http11_{}.s16le", name));
                 let mut f = fs::File::create(&output_path).unwrap();
                 f.write_all(&pcm_data).unwrap();
@@ -529,7 +529,7 @@ async fn test_http2_decode() {
     ];
 
     let mut results: Vec<(&str, DecodeResult)> = Vec::new();
-    let out_dir = golden_path("");
+    let out_dir = out_path("");
     fs::create_dir_all(&out_dir).ok();
 
     for (name, path) in formats {
@@ -556,7 +556,7 @@ async fn test_http2_decode() {
                     continue;
                 }
 
-                // Write golden output
+                // Write output
                 let output_path = out_dir.join(format!("http2_{}.s16le", name));
                 let mut f = fs::File::create(&output_path).unwrap();
                 f.write_all(&pcm_data).unwrap();
@@ -710,7 +710,7 @@ async fn test_http3_decode() {
     ];
 
     let mut results: Vec<(&str, DecodeResult)> = Vec::new();
-    let out_dir = golden_path("");
+    let out_dir = out_path("");
     fs::create_dir_all(&out_dir).ok();
 
     for (name, path) in formats {
@@ -729,7 +729,7 @@ async fn test_http3_decode() {
                     continue;
                 }
 
-                // Write golden output
+                // Write output
                 let output_path = out_dir.join(format!("http3_{}.s16le", name));
                 let mut f = fs::File::create(&output_path).unwrap();
                 f.write_all(&pcm_data).unwrap();
