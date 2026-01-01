@@ -513,6 +513,8 @@ async fn start_test_server() -> (u16, tokio::sync::watch::Sender<()>) {
             cert_pem_base64: cert,
             privkey_pem_base64: key,
             enable_h2: true,
+            enable_h3: false,
+            enable_webtransport: false,
             enable_websocket: false,
             enable_raw_tcp: false,
             raw_tcp_port: 0,

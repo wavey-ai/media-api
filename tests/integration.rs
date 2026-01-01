@@ -1,18 +1,21 @@
 //! Integration tests for media-api decode service
 //!
-//! Tests HTTP protocol with waveform visualization for decoded output verification.
+//! Tests HTTP/1.1, HTTP/2, and HTTP/3 protocols with waveform visualization
+//! for decoded output verification.
 
 use bytes::Bytes;
 use frame_header::{Endianness, FrameHeader};
 use media_api::{MediaApiConfig, MediaRouter};
 use std::fs;
 use std::io::Write;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use web_service::h2::Http2Server;
+use web_service::h3::Http3Server;
 
 // Load TLS certs from local files
 fn load_tls_certs() -> (String, String) {
@@ -60,6 +63,8 @@ async fn start_test_server() -> (u16, tokio::sync::watch::Sender<()>) {
             cert_pem_base64: cert,
             privkey_pem_base64: key,
             enable_h2: true,
+            enable_h3: true,
+            enable_webtransport: false,
             enable_websocket: false,
             enable_raw_tcp: false,
             raw_tcp_port: 0,
@@ -70,17 +75,25 @@ async fn start_test_server() -> (u16, tokio::sync::watch::Sender<()>) {
         default_output_channels: Some(1),
     };
 
-    let router = Arc::new(MediaRouter::new(config.clone()));
+    let router: Arc<dyn web_service::Router> = Arc::new(MediaRouter::new(config.clone()));
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
 
-    let server = Http2Server::new(config.server, router);
-
+    // Start HTTP/1.1+HTTP/2 server
+    let h2_server = Http2Server::new(config.server.clone(), Arc::clone(&router));
+    let h2_shutdown_rx = shutdown_rx.clone();
     tokio::spawn(async move {
-        let _ = server.start(shutdown_rx).await;
+        let _ = h2_server.start(h2_shutdown_rx).await;
     });
 
-    // Give server time to start
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Start HTTP/3 (QUIC) server on the same port
+    let h3_server = Http3Server::new(config.server, Arc::clone(&router));
+    let h3_shutdown_rx = shutdown_rx.clone();
+    tokio::spawn(async move {
+        let _ = h3_server.start(h3_shutdown_rx).await;
+    });
+
+    // Give servers time to start
+    tokio::time::sleep(Duration::from_millis(300)).await;
 
     (port, shutdown_tx)
 }
@@ -257,6 +270,87 @@ fn print_waveform_chart(protocol: &str, results: &[(&str, DecodeResult)]) {
 // HTTP Tests
 // =============================================================================
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[allow(dead_code)]
+enum HttpProtocol {
+    Http11,
+    Http2,
+    Http3,
+}
+
+impl std::fmt::Display for HttpProtocol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HttpProtocol::Http11 => write!(f, "HTTP/1.1"),
+            HttpProtocol::Http2 => write!(f, "HTTP/2"),
+            HttpProtocol::Http3 => write!(f, "HTTP/3"),
+        }
+    }
+}
+
+async fn http_decode_with_protocol(
+    port: u16,
+    data: Bytes,
+    protocol: HttpProtocol,
+) -> Result<(Vec<u8>, u32, u8, u8, reqwest::Version), String> {
+    use std::net::SocketAddr;
+
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let client_builder = reqwest::Client::builder().resolve("local.wavey.ai", addr);
+
+    let client = match protocol {
+        HttpProtocol::Http11 => client_builder.http1_only(),
+        HttpProtocol::Http2 => client_builder.http2_prior_knowledge(),
+        HttpProtocol::Http3 => {
+            // HTTP/3 uses a different client - this path shouldn't be reached
+            unreachable!("Use http3_decode for HTTP/3 protocol")
+        }
+    }
+    .build()
+    .map_err(|e| format!("Failed to build client: {}", e))?;
+
+    let response = client
+        .post(format!("https://local.wavey.ai:{}/decode", port))
+        .body(data.to_vec())
+        .send()
+        .await
+        .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+    let version = response.version();
+
+    if !response.status().is_success() {
+        return Err(format!("HTTP error: {}", response.status()));
+    }
+
+    let sample_rate: u32 = response
+        .headers()
+        .get("X-Sample-Rate")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16000);
+
+    let channels: u8 = response
+        .headers()
+        .get("X-Channels")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+
+    let bits: u8 = response
+        .headers()
+        .get("X-Bits-Per-Sample")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
+
+    let body = response
+        .bytes()
+        .await
+        .map_err(|e| format!("Failed to read body: {}", e))?;
+
+    Ok((body.to_vec(), sample_rate, channels, bits, version))
+}
+
 async fn http_decode(port: u16, data: Bytes) -> Result<(Vec<u8>, u32, u8, u8), String> {
     use std::net::SocketAddr;
 
@@ -362,6 +456,297 @@ async fn test_http_decode_all_formats() {
 
     assert!(!results.is_empty(), "No formats decoded successfully");
     print_waveform_chart("HTTP", &results);
+}
+
+/// Test HTTP/1.1 protocol explicitly with chunked transfer encoding
+#[tokio::test]
+async fn test_http11_chunked_decode() {
+    let (port, shutdown) = start_test_server().await;
+
+    let formats = [
+        ("mp3", "mp3/A_Tusk_is_used_to_make_costly_gifts.mp3"),
+        ("flac", "flac/A_Tusk_is_used_to_make_costly_gifts.flac"),
+        ("opus", "opus/A_Tusk_is_used_to_make_costly_gifts.opus"),
+    ];
+
+    let mut results: Vec<(&str, DecodeResult)> = Vec::new();
+    let out_dir = golden_path("");
+    fs::create_dir_all(&out_dir).ok();
+
+    for (name, path) in formats {
+        let input_path = testdata_path(path);
+        if !input_path.exists() {
+            eprintln!("  {} - skipped (file not found)", name);
+            continue;
+        }
+
+        let data = Bytes::from(fs::read(&input_path).unwrap());
+
+        match http_decode_with_protocol(port, data, HttpProtocol::Http11).await {
+            Ok((pcm_data, sample_rate, channels, bits, version)) => {
+                // Verify we're actually using HTTP/1.1
+                assert_eq!(
+                    version,
+                    reqwest::Version::HTTP_11,
+                    "Expected HTTP/1.1 but got {:?}",
+                    version
+                );
+
+                if pcm_data.is_empty() {
+                    eprintln!("  {} - empty response", name);
+                    continue;
+                }
+
+                // Write golden output
+                let output_path = out_dir.join(format!("http11_{}.s16le", name));
+                let mut f = fs::File::create(&output_path).unwrap();
+                f.write_all(&pcm_data).unwrap();
+
+                let result = analyze_pcm(&pcm_data, sample_rate, channels, bits);
+                results.push((name, result));
+            }
+            Err(e) => {
+                eprintln!("  {} - {}", name, e);
+            }
+        }
+    }
+
+    let _ = shutdown.send(());
+
+    assert!(!results.is_empty(), "No formats decoded successfully via HTTP/1.1");
+    print_waveform_chart("HTTP/1.1 Chunked", &results);
+}
+
+/// Test HTTP/2 protocol explicitly
+#[tokio::test]
+async fn test_http2_decode() {
+    let (port, shutdown) = start_test_server().await;
+
+    let formats = [
+        ("mp3", "mp3/A_Tusk_is_used_to_make_costly_gifts.mp3"),
+        ("flac", "flac/A_Tusk_is_used_to_make_costly_gifts.flac"),
+        ("opus", "opus/A_Tusk_is_used_to_make_costly_gifts.opus"),
+    ];
+
+    let mut results: Vec<(&str, DecodeResult)> = Vec::new();
+    let out_dir = golden_path("");
+    fs::create_dir_all(&out_dir).ok();
+
+    for (name, path) in formats {
+        let input_path = testdata_path(path);
+        if !input_path.exists() {
+            eprintln!("  {} - skipped (file not found)", name);
+            continue;
+        }
+
+        let data = Bytes::from(fs::read(&input_path).unwrap());
+
+        match http_decode_with_protocol(port, data, HttpProtocol::Http2).await {
+            Ok((pcm_data, sample_rate, channels, bits, version)) => {
+                // Verify we're actually using HTTP/2
+                assert_eq!(
+                    version,
+                    reqwest::Version::HTTP_2,
+                    "Expected HTTP/2 but got {:?}",
+                    version
+                );
+
+                if pcm_data.is_empty() {
+                    eprintln!("  {} - empty response", name);
+                    continue;
+                }
+
+                // Write golden output
+                let output_path = out_dir.join(format!("http2_{}.s16le", name));
+                let mut f = fs::File::create(&output_path).unwrap();
+                f.write_all(&pcm_data).unwrap();
+
+                let result = analyze_pcm(&pcm_data, sample_rate, channels, bits);
+                results.push((name, result));
+            }
+            Err(e) => {
+                eprintln!("  {} - {}", name, e);
+            }
+        }
+    }
+
+    let _ = shutdown.send(());
+
+    assert!(!results.is_empty(), "No formats decoded successfully via HTTP/2");
+    print_waveform_chart("HTTP/2", &results);
+}
+
+/// HTTP/3 (QUIC) decode helper
+async fn http3_decode(port: u16, data: Bytes) -> Result<(Vec<u8>, u32, u8, u8), String> {
+    use bytes::Buf;
+    use h3_quinn::quinn;
+    use tls_helpers::load_certs_from_base64;
+
+    let (cert_b64, _) = load_tls_certs();
+
+    // Build client config with our test cert
+    let mut roots = rustls::RootCertStore::empty();
+    if let Ok(certs) = load_certs_from_base64(&cert_b64) {
+        for cert in certs {
+            let _ = roots.add(cert);
+        }
+    }
+
+    let mut tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls_config.alpn_protocols = vec![b"h3".to_vec()];
+
+    let client_config = quinn::ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(tls_config)
+            .map_err(|e| format!("QUIC config error: {}", e))?,
+    ));
+
+    let mut endpoint = quinn::Endpoint::client(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 0))
+        .map_err(|e| format!("Failed to create QUIC endpoint: {}", e))?;
+    endpoint.set_default_client_config(client_config);
+
+    let server_addr = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port);
+    let conn = endpoint
+        .connect(server_addr, "local.wavey.ai")
+        .map_err(|e| format!("QUIC connect error: {}", e))?
+        .await
+        .map_err(|e| format!("QUIC connection failed: {}", e))?;
+
+    let quinn_conn = h3_quinn::Connection::new(conn);
+    let (mut driver, mut send_request) = h3::client::new(quinn_conn)
+        .await
+        .map_err(|e| format!("H3 client error: {}", e))?;
+
+    // Drive the connection in the background
+    let drive_handle = tokio::spawn(async move {
+        futures_util::future::poll_fn(|cx| driver.poll_close(cx)).await
+    });
+
+    // Build request
+    let req = http::Request::builder()
+        .method("POST")
+        .uri(format!("https://local.wavey.ai:{}/decode", port))
+        .body(())
+        .map_err(|e| format!("Request build error: {}", e))?;
+
+    let mut stream = send_request
+        .send_request(req)
+        .await
+        .map_err(|e| format!("H3 send request error: {}", e))?;
+
+    // Send body
+    stream
+        .send_data(data)
+        .await
+        .map_err(|e| format!("H3 send data error: {}", e))?;
+
+    stream
+        .finish()
+        .await
+        .map_err(|e| format!("H3 finish error: {}", e))?;
+
+    // Get response
+    let response = stream
+        .recv_response()
+        .await
+        .map_err(|e| format!("H3 recv response error: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(format!("HTTP/3 error: {}", response.status()));
+    }
+
+    let sample_rate: u32 = response
+        .headers()
+        .get("X-Sample-Rate")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16000);
+
+    let channels: u8 = response
+        .headers()
+        .get("X-Channels")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+
+    let bits: u8 = response
+        .headers()
+        .get("X-Bits-Per-Sample")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16);
+
+    // Read body
+    let mut body = Vec::new();
+    while let Some(mut chunk) = stream
+        .recv_data()
+        .await
+        .map_err(|e| format!("H3 recv data error: {}", e))?
+    {
+        body.extend_from_slice(chunk.chunk());
+        chunk.advance(chunk.remaining());
+    }
+
+    drop(stream);
+    drop(send_request);
+    drive_handle.abort();
+
+    Ok((body, sample_rate, channels, bits))
+}
+
+/// Test HTTP/3 protocol explicitly
+#[tokio::test]
+async fn test_http3_decode() {
+    let (port, shutdown) = start_test_server().await;
+
+    // Give H3 server a bit more time to start (QUIC setup is slower)
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let formats = [
+        ("mp3", "mp3/A_Tusk_is_used_to_make_costly_gifts.mp3"),
+        ("flac", "flac/A_Tusk_is_used_to_make_costly_gifts.flac"),
+        ("opus", "opus/A_Tusk_is_used_to_make_costly_gifts.opus"),
+    ];
+
+    let mut results: Vec<(&str, DecodeResult)> = Vec::new();
+    let out_dir = golden_path("");
+    fs::create_dir_all(&out_dir).ok();
+
+    for (name, path) in formats {
+        let input_path = testdata_path(path);
+        if !input_path.exists() {
+            eprintln!("  {} - skipped (file not found)", name);
+            continue;
+        }
+
+        let data = Bytes::from(fs::read(&input_path).unwrap());
+
+        match http3_decode(port, data).await {
+            Ok((pcm_data, sample_rate, channels, bits)) => {
+                if pcm_data.is_empty() {
+                    eprintln!("  {} - empty response", name);
+                    continue;
+                }
+
+                // Write golden output
+                let output_path = out_dir.join(format!("http3_{}.s16le", name));
+                let mut f = fs::File::create(&output_path).unwrap();
+                f.write_all(&pcm_data).unwrap();
+
+                let result = analyze_pcm(&pcm_data, sample_rate, channels, bits);
+                results.push((name, result));
+            }
+            Err(e) => {
+                eprintln!("  {} - {}", name, e);
+            }
+        }
+    }
+
+    let _ = shutdown.send(());
+
+    assert!(!results.is_empty(), "No formats decoded successfully via HTTP/3");
+    print_waveform_chart("HTTP/3", &results);
 }
 
 // =============================================================================

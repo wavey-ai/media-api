@@ -46,6 +46,11 @@ base64 = "0.22"
 [dev-dependencies]
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
+# HTTP/3 client for testing
+quinn = "0.11"
+h3 = { git = "https://github.com/hyperium/h3.git" }
+h3-quinn = { git = "https://github.com/hyperium/h3.git" }
+rustls = "0.23"
 
 [[bin]]
 name = "media-api"

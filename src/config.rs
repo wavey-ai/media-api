@@ -52,6 +52,8 @@ impl MediaApiConfig {
                 privkey_pem_base64,
                 port,
                 enable_h2: true,
+                enable_h3: true,
+                enable_webtransport: false,
                 enable_websocket: true,
                 enable_raw_tcp,
                 raw_tcp_port,

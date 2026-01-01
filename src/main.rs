@@ -58,6 +58,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cert_pem_base64: args.tls_cert_base64,
             privkey_pem_base64: args.tls_key_base64,
             enable_h2: true,
+            enable_h3: true,
+            enable_webtransport: false,
             enable_websocket: false,
             enable_raw_tcp: args.enable_raw_tcp,
             raw_tcp_port: args.raw_tcp_port,
