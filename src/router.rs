@@ -9,19 +9,30 @@ use serde_json::json;
 use soundkit_decoder::DecodeOptions;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use web_service::{
     BodyStream, HandlerResponse, HandlerResult, Router, ServerError, StreamWriter,
     WebSocketHandler, WebTransportHandler,
 };
 
+/// Maximum concurrent decode operations to prevent resource exhaustion
+const MAX_CONCURRENT_DECODES: usize = 200;
+
 pub struct MediaRouter {
     config: Arc<MediaApiConfig>,
+    /// Semaphore to limit concurrent decode operations
+    /// Each decode gets a fresh decoder - the semaphore ensures we don't
+    /// overwhelm the system with too many concurrent decoder threads
+    decode_semaphore: Arc<Semaphore>,
 }
 
 impl MediaRouter {
     pub fn new(config: MediaApiConfig) -> Self {
         let config = Arc::new(config);
-        Self { config }
+        Self {
+            config,
+            decode_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
+        }
     }
 
     fn merge_options(&self, query_options: DecodeOptions) -> DecodeOptions {
@@ -59,10 +70,21 @@ impl MediaRouter {
         req: Request<()>,
         mut body: BodyStream,
     ) -> HandlerResult<HandlerResponse> {
+        // Acquire a decode slot from the pool - this ensures we don't create
+        // too many concurrent decoder threads which can exhaust system resources
+        let _permit = self.decode_semaphore.acquire().await.map_err(|_| {
+            ServerError::Handler(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "Decoder pool exhausted",
+            )))
+        })?;
+
         let query = req.uri().query();
         let query_options = parse_decode_options(query);
         let options = self.merge_options(query_options);
 
+        // Create a fresh pipeline for this request - each request gets its own
+        // decoder instance to ensure complete state isolation
         let mut pipeline = create_pipeline(options);
 
         // Collect all decoded output

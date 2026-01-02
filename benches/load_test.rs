@@ -337,10 +337,13 @@ impl AutoscaleMonitor {
 // =============================================================================
 
 fn estimate_audio_duration(format: &str, file_size: usize) -> f64 {
+    // Bitrate estimates based on typical encoding settings
+    // More accurate estimates prevent misleading throughput comparisons
     let bitrate_kbps = match format {
         "mp3" => 48.0,
         "flac" => 400.0,
-        "opus" | "ogg_opus" => 32.0,
+        "opus" => 16.0,       // Raw opus typically ~16 kbps VBR
+        "ogg_opus" => 110.0,  // Ogg container with higher quality settings ~110 kbps
         "mac_aac" => 64.0,
         "wav_24" | "wav_32f" | "wav_stereo" => 768.0,
         "linear16" => 256.0,
@@ -769,7 +772,8 @@ async fn main() {
     println!("╚══════════════════════════════════════════════════════════════════════════════════╝");
     println!();
 
-    // Only test formats that are working (FLAC has known issues in concurrent streaming)
+    // Note: FLAC excluded due to soundkit-flac release-mode bug (FFI issue)
+    // See: soundkit-flac tests fail in release mode but pass in debug mode
     let formats: Vec<&str> = vec![
         "mp3",
         "opus",
@@ -812,7 +816,7 @@ async fn main() {
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
     let client = reqwest::Client::builder()
         .resolve("local.wavey.ai", addr)
-        .http2_prior_knowledge() // Use HTTP/2 for max concurrent streams per connection
+        .http2_prior_knowledge() // Use HTTP/2 for multiplexed concurrent streams
         .pool_max_idle_per_host(MAX_CONCURRENCY)
         .pool_idle_timeout(Duration::from_secs(60))
         .timeout(Duration::from_secs(30))
