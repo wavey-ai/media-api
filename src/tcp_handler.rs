@@ -3,7 +3,6 @@ use bytes::Bytes;
 use frame_header::EncodingFlag;
 use soundkit_decoder::DecodeOptions;
 use std::sync::Arc;
-use std::time::Duration;
 use tcp_changes::framing::{read_frame, write_frame, tags};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
@@ -94,42 +93,49 @@ impl TcpDecodeServer {
         R: AsyncRead + Unpin,
         W: AsyncWrite + Unpin,
     {
-        // Acquire decoder from pool
-        let decoder = self.decoder_pool.acquire(self.options.clone()).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Other, e)
-        })?;
-
-        let mut first_meta_sent = false;
-
-        // Read frames from client
+        // Persistent connection - handle multiple decode sessions
         loop {
-            let frame = match read_frame(&mut reader).await? {
+            // Wait for first frame to start a new session
+            let first_frame = match read_frame(&mut reader).await? {
                 Some(f) => f,
                 None => {
-                    // EOF - signal decoder and flush
-                    let _ = decoder.send(Bytes::new());
-                    break;
+                    // EOF - client closed connection
+                    return Ok(());
                 }
             };
 
-            if frame.tag_matches(tags::DCOD) {
-                // Send data to decoder
-                if frame.data.is_empty() {
-                    // Empty DCOD signals end of input
-                    let _ = decoder.send(Bytes::new());
-                    break;
-                }
+            // Must be DCOD to start a session
+            if !first_frame.tag_matches(tags::DCOD) {
+                warn!("Expected DCOD to start session, got {:?}", first_frame.tag);
+                continue;
+            }
 
-                if let Err(e) = decoder.send(frame.data) {
+            // Acquire decoder from pool for this session
+            let decoder = self.decoder_pool.acquire(self.options.clone()).map_err(|e| {
+                std::io::Error::new(std::io::ErrorKind::Other, e)
+            })?;
+
+            let mut first_meta_sent = false;
+            let mut session_done = false;
+
+            // Process first frame
+            if !first_frame.data.is_empty() {
+                if let Err(e) = decoder.send(first_frame.data) {
                     warn!("Decoder send error: {}", e);
-                    break;
+                    session_done = true;
                 }
+            } else {
+                // Empty DCOD signals end of input immediately
+                let _ = decoder.send(Bytes::new());
+                session_done = true;
+            }
 
-                // Drain available output
+            // Read frames for this session
+            while !session_done {
+                // Drain available output before reading next frame
                 loop {
                     match decoder.try_recv() {
                         Ok(Some(Ok(audio_data))) => {
-                            // Send metadata on first frame
                             if !first_meta_sent {
                                 let encoding = match audio_data.audio_format() {
                                     EncodingFlag::PCMFloat => PcmEncoding::Float,
@@ -144,63 +150,78 @@ impl TcpDecodeServer {
                                 write_frame(&mut writer, tags::META, &meta).await?;
                                 first_meta_sent = true;
                             }
-
-                            // Send PCM data
                             write_frame(&mut writer, tags::PCMS, audio_data.data()).await?;
                         }
                         Ok(Some(Err(e))) => {
                             warn!("Decode error: {}", e);
                         }
-                        Ok(None) => break, // No more data ready
-                        Err(()) => {
-                            // Channel closed - decoder finished
-                            break;
+                        Ok(None) => break,
+                        Err(()) => break,
+                    }
+                }
+
+                let frame = match read_frame(&mut reader).await? {
+                    Some(f) => f,
+                    None => {
+                        // EOF - signal decoder and end
+                        let _ = decoder.send(Bytes::new());
+                        session_done = true;
+                        break;
+                    }
+                };
+
+                if frame.tag_matches(tags::DCOD) {
+                    if frame.data.is_empty() {
+                        // Empty DCOD signals end of input
+                        let _ = decoder.send(Bytes::new());
+                        session_done = true;
+                    } else {
+                        if let Err(e) = decoder.send(frame.data) {
+                            warn!("Decoder send error: {}", e);
+                            session_done = true;
                         }
                     }
+                } else if frame.tag_matches(tags::DONE) {
+                    // Client signaling end
+                    let _ = decoder.send(Bytes::new());
+                    session_done = true;
+                } else {
+                    warn!("Unknown tag: {:?}", frame.tag);
                 }
-            } else if frame.tag_matches(tags::DONE) {
-                // Client signaling end
-                let _ = decoder.send(Bytes::new());
-                break;
-            } else {
-                warn!("Unknown tag: {:?}", frame.tag);
             }
-        }
 
-        // Flush remaining output using blocking recv - channel closes when done
-        loop {
-            match decoder.recv() {
-                Some(Ok(audio_data)) => {
-                    if !first_meta_sent {
-                        let encoding = match audio_data.audio_format() {
-                            EncodingFlag::PCMFloat => PcmEncoding::Float,
-                            _ => PcmEncoding::Signed,
-                        };
-                        let meta = encode_meta(
-                            audio_data.sampling_rate(),
-                            audio_data.channel_count(),
-                            audio_data.bits_per_sample(),
-                            encoding,
-                        );
-                        write_frame(&mut writer, tags::META, &meta).await?;
-                        first_meta_sent = true;
+            // Flush remaining output for this session
+            loop {
+                match decoder.recv() {
+                    Some(Ok(audio_data)) => {
+                        if !first_meta_sent {
+                            let encoding = match audio_data.audio_format() {
+                                EncodingFlag::PCMFloat => PcmEncoding::Float,
+                                _ => PcmEncoding::Signed,
+                            };
+                            let meta = encode_meta(
+                                audio_data.sampling_rate(),
+                                audio_data.channel_count(),
+                                audio_data.bits_per_sample(),
+                                encoding,
+                            );
+                            write_frame(&mut writer, tags::META, &meta).await?;
+                            first_meta_sent = true;
+                        }
+                        write_frame(&mut writer, tags::PCMS, audio_data.data()).await?;
                     }
-                    write_frame(&mut writer, tags::PCMS, audio_data.data()).await?;
-                }
-                Some(Err(e)) => {
-                    warn!("Decode error during flush: {}", e);
-                }
-                None => {
-                    // Channel closed - decoder finished
-                    break;
+                    Some(Err(e)) => {
+                        warn!("Decode error during flush: {}", e);
+                    }
+                    None => break,
                 }
             }
+
+            // Send DONE signal for this session
+            write_frame(&mut writer, tags::DONE, &[]).await?;
+
+            // Continue loop to handle next session on same connection
         }
-
-        // Send DONE signal
-        write_frame(&mut writer, tags::DONE, &[]).await?;
-
-        Ok(())
     }
 }
 
