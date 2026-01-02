@@ -1,6 +1,5 @@
 use crate::pool::DecoderPool;
 use bytes::Bytes;
-use frame_header::EncodingFlag;
 use futures_util::StreamExt;
 use soundkit_decoder::DecodeOptions;
 use std::pin::Pin;
@@ -16,7 +15,7 @@ pub mod decode {
 
 use decode::decode_response::Content;
 use decode::decode_service_server::{DecodeService, DecodeServiceServer};
-use decode::{AudioMetadata, DecodeRequest, DecodeResponse, PcmEncoding};
+use decode::{DecodeRequest, DecodeResponse};
 
 pub struct GrpcDecodeService {
     decoder_pool: Arc<DecoderPool>,
@@ -96,8 +95,6 @@ impl DecodeService for GrpcDecodeService {
 
         // Spawn task to handle decoding
         tokio::spawn(async move {
-            let mut first_meta_sent = false;
-
             // Process input stream
             while let Some(chunk_result) = input_stream.next().await {
                 match chunk_result {
@@ -113,29 +110,6 @@ impl DecodeService for GrpcDecodeService {
                         loop {
                             match decoder.try_recv() {
                                 Ok(Some(Ok(audio_data))) => {
-                                    // Send metadata before first PCM chunk
-                                    if !first_meta_sent {
-                                        let meta = AudioMetadata {
-                                            sample_rate: audio_data.sampling_rate(),
-                                            channels: audio_data.channel_count() as u32,
-                                            bits_per_sample: audio_data.bits_per_sample() as u32,
-                                            encoding: match audio_data.audio_format() {
-                                                EncodingFlag::PCMFloat => PcmEncoding::PcmFloat as i32,
-                                                _ => PcmEncoding::PcmSigned as i32,
-                                            },
-                                        };
-                                        if tx
-                                            .send(Ok(DecodeResponse {
-                                                content: Some(Content::Metadata(meta)),
-                                            }))
-                                            .await
-                                            .is_err()
-                                        {
-                                            return;
-                                        }
-                                        first_meta_sent = true;
-                                    }
-
                                     // Send PCM data
                                     if tx
                                         .send(Ok(DecodeResponse {
@@ -170,28 +144,6 @@ impl DecodeService for GrpcDecodeService {
             loop {
                 match decoder.recv() {
                     Some(Ok(audio_data)) => {
-                        if !first_meta_sent {
-                            let meta = AudioMetadata {
-                                sample_rate: audio_data.sampling_rate(),
-                                channels: audio_data.channel_count() as u32,
-                                bits_per_sample: audio_data.bits_per_sample() as u32,
-                                encoding: match audio_data.audio_format() {
-                                    EncodingFlag::PCMFloat => PcmEncoding::PcmFloat as i32,
-                                    _ => PcmEncoding::PcmSigned as i32,
-                                },
-                            };
-                            if tx
-                                .send(Ok(DecodeResponse {
-                                    content: Some(Content::Metadata(meta)),
-                                }))
-                                .await
-                                .is_err()
-                            {
-                                return;
-                            }
-                            first_meta_sent = true;
-                        }
-
                         if tx
                             .send(Ok(DecodeResponse {
                                 content: Some(Content::PcmData(audio_data.data().to_vec())),

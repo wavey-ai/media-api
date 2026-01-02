@@ -1,9 +1,10 @@
-use media_api::{DecoderPool, MediaApiConfig, MediaRouter, TcpDecodeServer};
+use media_api::{DecoderPool, GrpcDecodeService, MediaApiConfig, MediaRouter, TcpDecodeServer};
 use soundkit_decoder::DecodeOptions;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use structopt::StructOpt;
 use tls_helpers::tls_acceptor_from_base64;
+use tonic::transport::Server as TonicServer;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use web_service::h2::Http2Server;
@@ -29,6 +30,12 @@ struct Command {
 
     #[structopt(long, env = "RAW_TCP_TLS")]
     raw_tcp_tls: bool,
+
+    #[structopt(long, env = "GRPC_PORT", default_value = "50051")]
+    grpc_port: u16,
+
+    #[structopt(long, env = "ENABLE_GRPC", parse(try_from_str), default_value = "true")]
+    enable_grpc: bool,
 
     #[structopt(long, env = "DEFAULT_OUTPUT_SAMPLE_RATE")]
     default_output_sample_rate: Option<u32>,
@@ -134,6 +141,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "TCP decode server started on port {} (TLS: {})",
             args.raw_tcp_port, args.raw_tcp_tls
         );
+    }
+
+    // Start gRPC server if enabled
+    if args.enable_grpc {
+        let grpc_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), args.grpc_port);
+
+        // Create decoder pool for gRPC server
+        let pool_size = num_cpus::get() * 2;
+        let grpc_decoder_pool = Arc::new(DecoderPool::new(pool_size));
+
+        let grpc_decode_options = DecodeOptions {
+            output_sample_rate: args.default_output_sample_rate,
+            output_bits_per_sample: args.default_output_bits,
+            output_channels: args.default_output_channels,
+        };
+
+        let grpc_service = GrpcDecodeService::new(grpc_decoder_pool, grpc_decode_options);
+
+        let mut grpc_shutdown_rx = shutdown_rx.clone();
+        tokio::spawn(async move {
+            info!("gRPC server starting on port {}", grpc_addr.port());
+            if let Err(e) = TonicServer::builder()
+                .add_service(grpc_service.into_server())
+                .serve_with_shutdown(grpc_addr, async move {
+                    let _ = grpc_shutdown_rx.changed().await;
+                })
+                .await
+            {
+                tracing::error!("gRPC server error: {}", e);
+            }
+        });
+
+        info!("gRPC decode server started on port {}", args.grpc_port);
     }
 
     // Start HTTP/1.1 + HTTP/2 server

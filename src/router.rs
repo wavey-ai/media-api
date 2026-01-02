@@ -4,7 +4,6 @@ use crate::pool::DecoderPool;
 use crate::stats::Stats;
 use async_trait::async_trait;
 use bytes::Bytes;
-use frame_header::EncodingFlag;
 use futures_util::StreamExt;
 use http::{Request, Response, StatusCode};
 use serde_json::json;
@@ -122,8 +121,6 @@ impl MediaRouter {
             .map_err(ServerError::Http)?;
         stream_writer.send_response(response).await?;
 
-        let mut first_meta_sent = false;
-
         // Feed input chunks to decoder and stream output
         while let Some(chunk_result) = body.next().await {
             match chunk_result {
@@ -139,21 +136,6 @@ impl MediaRouter {
                     loop {
                         match decoder.try_recv() {
                             Ok(Some(Ok(audio_data))) => {
-                                // Send metadata before first PCM chunk
-                                if !first_meta_sent {
-                                    let meta = encode_meta(
-                                        audio_data.sampling_rate(),
-                                        audio_data.channel_count(),
-                                        audio_data.bits_per_sample(),
-                                        match audio_data.audio_format() {
-                                            EncodingFlag::PCMFloat => PcmEncoding::Float,
-                                            _ => PcmEncoding::Signed,
-                                        },
-                                    );
-                                    stream_writer.send_data(Bytes::copy_from_slice(&meta)).await?;
-                                    first_meta_sent = true;
-                                }
-                                // Stream PCM data
                                 stream_writer.send_data(Bytes::copy_from_slice(audio_data.data())).await?;
                             }
                             Ok(Some(Err(e))) => {
@@ -178,19 +160,6 @@ impl MediaRouter {
         loop {
             match decoder.recv() {
                 Some(Ok(audio_data)) => {
-                    if !first_meta_sent {
-                        let meta = encode_meta(
-                            audio_data.sampling_rate(),
-                            audio_data.channel_count(),
-                            audio_data.bits_per_sample(),
-                            match audio_data.audio_format() {
-                                EncodingFlag::PCMFloat => PcmEncoding::Float,
-                                _ => PcmEncoding::Signed,
-                            },
-                        );
-                        stream_writer.send_data(Bytes::copy_from_slice(&meta)).await?;
-                        first_meta_sent = true;
-                    }
                     stream_writer.send_data(Bytes::copy_from_slice(audio_data.data())).await?;
                 }
                 Some(Err(e)) => {
@@ -202,24 +171,6 @@ impl MediaRouter {
 
         stream_writer.finish().await
     }
-}
-
-/// Encoding type for PCM data
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum PcmEncoding {
-    Signed = 0,
-    Float = 1,
-}
-
-/// Encode audio metadata: sample_rate (4 bytes) + channels (1 byte) + bits (1 byte) + encoding (1 byte)
-fn encode_meta(sample_rate: u32, channels: u8, bits: u8, encoding: PcmEncoding) -> [u8; 7] {
-    let mut buf = [0u8; 7];
-    buf[0..4].copy_from_slice(&sample_rate.to_be_bytes());
-    buf[4] = channels;
-    buf[5] = bits;
-    buf[6] = encoding as u8;
-    buf
 }
 
 #[async_trait]

@@ -4,6 +4,7 @@ authors = ["Jamie Brough <jamie@wavey.ai>"]
 version = "0.1.0"
 edition = "2021"
 autobenches = false
+default-run = "media-api"
 
 [dependencies]
 # Server framework from web-services

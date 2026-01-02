@@ -1515,21 +1515,14 @@ async fn test_grpc_decode_streaming() {
 
         let mut response_stream = response.into_inner();
         let mut pcm_data = Vec::new();
-        let mut metadata_received = false;
-        let mut sample_rate = 0u32;
-        let mut channels = 0u32;
-        let mut bits = 0u32;
 
         while let Some(msg) = response_stream.next().await {
             match msg {
                 Ok(decode_response) => {
                     if let Some(content) = decode_response.content {
                         match content {
-                            media_api::grpc::decode::decode_response::Content::Metadata(meta) => {
-                                sample_rate = meta.sample_rate;
-                                channels = meta.channels;
-                                bits = meta.bits_per_sample;
-                                metadata_received = true;
+                            media_api::grpc::decode::decode_response::Content::Metadata(_) => {
+                                // Metadata no longer sent - client knows format from request
                             }
                             media_api::grpc::decode::decode_response::Content::PcmData(data) => {
                                 pcm_data.extend_from_slice(&data);
@@ -1549,7 +1542,7 @@ async fn test_grpc_decode_streaming() {
             continue;
         }
 
-        // Analyze and display results
+        // Analyze and display results - use requested format (16kHz mono 16-bit)
         let result = analyze_pcm(&pcm_data, 16000, 1, 16);
         let duration = result.bytes as f64 / 2.0 / 16000.0;
         let db = if result.rms > 0.0 {
@@ -1559,23 +1552,15 @@ async fn test_grpc_decode_streaming() {
         };
 
         println!(
-            "  {} - {} bytes in -> {} bytes out, {:.2}s, {:.1} dB, meta: {}Hz/{}ch/{}bit",
+            "  {} - {} bytes in -> {} bytes out, {:.2}s, {:.1} dB",
             format_name,
             input_size,
             pcm_data.len(),
             duration,
-            db,
-            sample_rate,
-            channels,
-            bits
+            db
         );
         print_waveform(&result.waveform);
 
-        assert!(
-            metadata_received,
-            "{} - No metadata received",
-            format_name
-        );
         assert!(
             duration > 0.5,
             "{} - Duration too short: {:.2}s",
