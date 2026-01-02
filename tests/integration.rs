@@ -970,3 +970,232 @@ async fn test_status_endpoint() {
 
     let _ = shutdown.send(());
 }
+
+// =============================================================================
+// Concatenation Tests
+// =============================================================================
+
+/// Test that MP3 files can be concatenated and decoded in a single stream.
+/// MP3 is frame-based with sync words, so the decoder should handle multiple
+/// file headers naturally without needing to restart.
+#[tokio::test]
+async fn test_mp3_concatenation() {
+    let (port, shutdown) = start_test_server().await;
+
+    // Load all MP3 files from testdata
+    let mp3_dir = testdata_path("mp3");
+    let mut mp3_files: Vec<_> = fs::read_dir(&mp3_dir)
+        .expect("mp3 testdata dir not found")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map(|ext| ext == "mp3").unwrap_or(false))
+        .collect();
+    mp3_files.sort_by_key(|e| e.path());
+
+    // Take up to 10 files for the test
+    let files_to_concat: Vec<_> = mp3_files.iter().take(10).collect();
+    assert!(
+        files_to_concat.len() >= 2,
+        "Need at least 2 MP3 files for concatenation test"
+    );
+
+    // Decode each file individually and track expected output
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let client = reqwest::Client::builder()
+        .resolve("local.wavey.ai", addr)
+        .build()
+        .expect("Failed to build client");
+
+    let mut individual_outputs: Vec<Vec<u8>> = Vec::new();
+    let mut total_individual_bytes = 0usize;
+
+    println!("\n  MP3 Concatenation Test");
+    println!("  {}", "═".repeat(60));
+    println!("  Decoding {} files individually...", files_to_concat.len());
+
+    for entry in &files_to_concat {
+        let data = fs::read(entry.path()).expect("Failed to read MP3 file");
+        let response = client
+            .post(format!("https://local.wavey.ai:{}/decode", port))
+            .body(data)
+            .send()
+            .await
+            .expect("Individual decode request failed");
+
+        assert!(response.status().is_success());
+        let pcm = response.bytes().await.unwrap().to_vec();
+        total_individual_bytes += pcm.len();
+        individual_outputs.push(pcm);
+    }
+
+    println!(
+        "  Individual total: {} bytes from {} files",
+        total_individual_bytes,
+        files_to_concat.len()
+    );
+
+    // Now concatenate all MP3 files and decode as single stream
+    let mut concatenated = Vec::new();
+    for entry in &files_to_concat {
+        let data = fs::read(entry.path()).expect("Failed to read MP3 file");
+        concatenated.extend_from_slice(&data);
+    }
+
+    println!("  Concatenated input: {} bytes", concatenated.len());
+
+    let response = client
+        .post(format!("https://local.wavey.ai:{}/decode", port))
+        .body(concatenated)
+        .send()
+        .await
+        .expect("Concatenated decode request failed");
+
+    assert!(
+        response.status().is_success(),
+        "Concatenated decode failed: {}",
+        response.status()
+    );
+
+    let concat_pcm = response.bytes().await.unwrap();
+    println!("  Concatenated output: {} bytes", concat_pcm.len());
+
+    // The concatenated output should be approximately equal to sum of individual outputs
+    // Allow some tolerance for decoder state/buffer differences
+    let ratio = concat_pcm.len() as f64 / total_individual_bytes as f64;
+    println!("  Ratio (concat/individual): {:.3}", ratio);
+
+    // Should be within 5% of expected
+    assert!(
+        ratio > 0.95 && ratio < 1.05,
+        "Concatenated output size {} differs significantly from individual total {} (ratio: {:.3})",
+        concat_pcm.len(),
+        total_individual_bytes,
+        ratio
+    );
+
+    // Visualize the concatenated waveform
+    let result = analyze_pcm(&concat_pcm, 16000, 1, 16);
+    println!(
+        "  Duration: {:.2}s, RMS: {:.1} dB",
+        result.bytes as f64 / 2.0 / 16000.0,
+        if result.rms > 0.0 {
+            20.0 * result.rms.log10()
+        } else {
+            -96.0
+        }
+    );
+    print_waveform(&result.waveform);
+
+    let _ = shutdown.send(());
+}
+
+/// Test that AAC ADTS files can be concatenated and decoded in a single stream.
+/// AAC ADTS frames are self-contained with headers, similar to MP3.
+#[tokio::test]
+async fn test_aac_adts_concatenation() {
+    let (port, shutdown) = start_test_server().await;
+
+    // Load all AAC files from testdata
+    let aac_dir = testdata_path("aac");
+    if !aac_dir.exists() {
+        println!("  Skipping AAC concatenation test - no aac testdata dir");
+        let _ = shutdown.send(());
+        return;
+    }
+
+    let mut aac_files: Vec<_> = fs::read_dir(&aac_dir)
+        .expect("aac testdata dir not found")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map(|ext| ext == "aac").unwrap_or(false))
+        .collect();
+    aac_files.sort_by_key(|e| e.path());
+
+    // Take up to 10 files for the test
+    let files_to_concat: Vec<_> = aac_files.iter().take(10).collect();
+    if files_to_concat.len() < 2 {
+        println!("  Skipping AAC concatenation test - need at least 2 files");
+        let _ = shutdown.send(());
+        return;
+    }
+
+    let addr: std::net::SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+    let client = reqwest::Client::builder()
+        .resolve("local.wavey.ai", addr)
+        .build()
+        .expect("Failed to build client");
+
+    let mut total_individual_bytes = 0usize;
+
+    println!("\n  AAC ADTS Concatenation Test");
+    println!("  {}", "═".repeat(60));
+    println!("  Decoding {} files individually...", files_to_concat.len());
+
+    for entry in &files_to_concat {
+        let data = fs::read(entry.path()).expect("Failed to read AAC file");
+        let response = client
+            .post(format!("https://local.wavey.ai:{}/decode", port))
+            .body(data)
+            .send()
+            .await
+            .expect("Individual decode request failed");
+
+        assert!(response.status().is_success());
+        let pcm = response.bytes().await.unwrap();
+        total_individual_bytes += pcm.len();
+    }
+
+    println!(
+        "  Individual total: {} bytes from {} files",
+        total_individual_bytes,
+        files_to_concat.len()
+    );
+
+    // Concatenate all AAC files
+    let mut concatenated = Vec::new();
+    for entry in &files_to_concat {
+        let data = fs::read(entry.path()).expect("Failed to read AAC file");
+        concatenated.extend_from_slice(&data);
+    }
+
+    println!("  Concatenated input: {} bytes", concatenated.len());
+
+    let response = client
+        .post(format!("https://local.wavey.ai:{}/decode", port))
+        .body(concatenated)
+        .send()
+        .await
+        .expect("Concatenated decode request failed");
+
+    assert!(
+        response.status().is_success(),
+        "Concatenated decode failed: {}",
+        response.status()
+    );
+
+    let concat_pcm = response.bytes().await.unwrap();
+    println!("  Concatenated output: {} bytes", concat_pcm.len());
+
+    let ratio = concat_pcm.len() as f64 / total_individual_bytes as f64;
+    println!("  Ratio (concat/individual): {:.3}", ratio);
+
+    assert!(
+        ratio > 0.95 && ratio < 1.05,
+        "Concatenated output size {} differs significantly from individual total {} (ratio: {:.3})",
+        concat_pcm.len(),
+        total_individual_bytes,
+        ratio
+    );
+
+    let result = analyze_pcm(&concat_pcm, 16000, 1, 16);
+    println!(
+        "  Duration: {:.2}s, RMS: {:.1} dB",
+        result.bytes as f64 / 2.0 / 16000.0,
+        if result.rms > 0.0 {
+            20.0 * result.rms.log10()
+        } else {
+            -96.0
+        }
+    );
+    print_waveform(&result.waveform);
+
+    let _ = shutdown.send(());
+}

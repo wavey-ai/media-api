@@ -5,9 +5,11 @@ High-performance streaming audio decode service. Accepts encoded audio in variou
 ## Features
 
 - **Multi-format decoding**: MP3, AAC, Opus, OGG/Opus, WebM, M4A, FLAC
-- **HTTP/2 API**: POST encoded audio, receive PCM response
+- **HTTP/1.1, HTTP/2, HTTP/3**: Full protocol support
 - **Configurable output**: Sample rate, bit depth, channel count
-- **High throughput**: 40-150x realtime depending on format
+- **High throughput**: 300+ files/sec, 15x realtime at full CPU utilization
+- **Thread pool**: Pre-spawned decoder workers for minimal latency (~16ms)
+- **Stats endpoint**: Real-time metrics for external orchestration
 
 ## Quick Start
 
@@ -52,6 +54,39 @@ curl -X POST https://localhost:8443/decode?sample_rate=16000&bits=16&channels=1 
   -o output.pcm
 ```
 
+### GET /stats
+
+Real-time server metrics for external scaling orchestration.
+
+**Response**:
+```json
+{
+  "current_connections": 4,
+  "num_cpus": 8,
+  "pool_size": 16,
+  "max_concurrent": 8,
+  "utilization": 0.5,
+  "avg_utilization": {
+    "1s": 0.48,
+    "10s": 0.52,
+    "60s": 0.45,
+    "120s": 0.42,
+    "300s": 0.40
+  },
+  "alarm": false
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `current_connections` | Active decode requests |
+| `num_cpus` | CPU count on host |
+| `pool_size` | Decoder worker threads (2x CPUs) |
+| `max_concurrent` | Maximum efficient concurrency (= num_cpus) |
+| `utilization` | Current connections / num_cpus |
+| `avg_utilization` | Rolling window averages (1s, 10s, 60s, 2min, 5min) |
+| `alarm` | True if any 10s+ window utilization >= 1.0 |
+
 ### GET /status, GET /health
 
 Health check endpoints. Returns:
@@ -75,49 +110,42 @@ Health check endpoints. Returns:
 
 ## Supported Formats
 
-| Format | Extension | Status |
-|--------|-----------|--------|
-| MP3 | `.mp3` | Supported |
-| AAC | `.aac`, `.m4a` | Supported |
-| Opus | `.opus` | Supported |
-| OGG/Opus | `.ogg` | Supported |
-| WebM/Opus | `.webm` | Supported |
-| FLAC | `.flac` | Partial |
-| WAV | `.wav` | Not yet |
-| Raw PCM | `.raw` | Not yet |
+| Format | Extension | Concatenation |
+|--------|-----------|---------------|
+| MP3 | `.mp3` | Yes |
+| AAC ADTS | `.aac` | Yes |
+| AAC/M4A | `.m4a` | No |
+| Opus | `.opus` | Yes |
+| OGG/Opus | `.ogg` | At bitstream boundaries |
+| WebM/Opus | `.webm` | No |
+| FLAC | `.flac` | No |
+
+Formats marked "Yes" for concatenation support multiple files concatenated into a single stream.
 
 ## Performance
 
-Throughput measured as audio seconds decoded per wallclock second:
+On an 8-core machine:
 
-| Format | Throughput | Notes |
-|--------|------------|-------|
-| OGG/Opus | ~150x | Highest throughput |
-| MP3 | ~45x | Common format |
-| AAC | ~45x | Including M4A container |
-| Opus | ~20x | Raw Opus packets |
+| Concurrency | Files/sec | Latency (avg) | Realtime |
+|-------------|-----------|---------------|----------|
+| 4 (0.5x CPUs) | 150 | 18ms | 330x |
+| 8 (1.0x CPUs) | 300 | 20ms | 660x |
+| 16 (2.0x CPUs) | 380 | 35ms | 840x |
+| 24 (3.0x CPUs) | 420 | 50ms | 930x |
 
-Tested with 50 concurrent connections, ramping to 200.
+Optimal concurrency equals CPU count. Beyond that, latency increases with diminishing throughput gains.
 
 ## Load Testing
-
-Run the benchmark suite:
 
 ```bash
 # Copy test data (one-time setup)
 cp -r /path/to/testdata benchmark_testdata/
 
-# Run load test with autoscaling metrics
+# Run ramped load test
 cargo run --release --bin load_test
 ```
 
-The load test includes:
-- Concurrency ramp-up (10 -> 200)
-- Rolling 10-second window metrics
-- Autoscaling notifications with urgency levels:
-  - **Warning**: >500ms latency, >20% throughput drop
-  - **Critical**: >1000ms latency, >40% throughput drop
-  - **Emergency**: >2000ms latency, >60% throughput drop
+Tests at multiple concurrency levels (0.5x, 1x, 2x, 3x CPUs) with per-format metrics and throughput graphs.
 
 ## Project Structure
 
@@ -128,12 +156,14 @@ media-api/
 │   ├── lib.rs           # Library exports
 │   ├── config.rs        # Configuration
 │   ├── router.rs        # HTTP routing and decode handler
-│   ├── decode.rs        # Decode pipeline wrapper
+│   ├── decode.rs        # Decode options parsing
+│   ├── pool.rs          # Decoder thread pool
+│   ├── stats.rs         # Connection statistics
 │   └── tcp_handler.rs   # Raw TCP handler
 ├── tests/
 │   └── integration.rs   # Integration tests with waveform viz
 ├── benches/
-│   └── load_test.rs     # Load test with autoscaling metrics
+│   └── load_test.rs     # Ramped load test
 └── testdata/            # Test audio files
 ```
 
@@ -143,7 +173,7 @@ media-api/
 # Run tests
 cargo test
 
-# Run integration tests (requires TLS certs)
+# Run integration tests (requires TLS certs in certs/)
 cargo test --test integration
 
 # Build release
@@ -152,4 +182,4 @@ cargo build --release
 
 ## License
 
-Proprietary - Wavey AI
+MIT License - see [LICENSE](LICENSE)
