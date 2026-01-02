@@ -156,16 +156,20 @@ impl MediaRouter {
         // Signal EOF and drain remaining output
         let _ = decoder.send(Bytes::new());
 
-        // Wait for decoder to finish using blocking recv
+        // Wait for decoder to finish - use try_recv with yields to avoid blocking
         loop {
-            match decoder.recv() {
-                Some(Ok(audio_data)) => {
+            match decoder.try_recv() {
+                Ok(Some(Ok(audio_data))) => {
                     stream_writer.send_data(Bytes::copy_from_slice(audio_data.data())).await?;
                 }
-                Some(Err(e)) => {
+                Ok(Some(Err(e))) => {
                     tracing::warn!("Decode error during flush: {}", e);
                 }
-                None => break,
+                Ok(None) => {
+                    // No data ready yet, yield to let other tasks run
+                    tokio::task::yield_now().await;
+                }
+                Err(()) => break, // Channel closed, decoder finished
             }
         }
 

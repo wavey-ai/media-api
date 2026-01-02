@@ -20,6 +20,7 @@ use tcp_changes::framing::{read_frame, tags, write_frame};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use web_service::h2::Http2Server;
 use web_service::h3::Http3Server;
@@ -61,8 +62,8 @@ fn golden_path(file: &str) -> PathBuf {
 
 /// All audio formats to test
 const TEST_FORMATS: &[(&str, &str)] = &[
-    ("mp3", "mp3/A_Tusk_is_used_to_make_costly_gifts.mp3"),
     ("flac", "flac/A_Tusk_is_used_to_make_costly_gifts.flac"),
+    ("mp3", "mp3/A_Tusk_is_used_to_make_costly_gifts.mp3"),
     ("aac", "aac/A_Tusk_is_used_to_make_costly_gifts.aac"),
     ("m4a", "m4a/A_Tusk_is_used_to_make_costly_gifts.m4a"),
     ("m4a_slow", "m4a_slow/A_Tusk_is_used_to_make_costly_gifts.m4a"),
@@ -1418,7 +1419,7 @@ async fn start_grpc_server() -> (u16, tokio::sync::oneshot::Sender<()>) {
         output_channels: Some(1),
     };
 
-    let grpc_service = GrpcDecodeService::new(decoder_pool, default_options);
+    let grpc_service = GrpcDecodeService::new(decoder_pool, default_options, CancellationToken::new());
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
@@ -1484,6 +1485,7 @@ async fn test_grpc_decode_streaming() {
                         output_bits_per_sample: 16,
                         output_channels: 1,
                     }),
+                    new_segment: false,
                 })
                 .await;
 
@@ -1496,6 +1498,7 @@ async fn test_grpc_decode_streaming() {
                     .send(DecodeRequest {
                         data: chunk,
                         options: None,
+                        new_segment: false,
                     })
                     .await
                     .is_err()
@@ -1607,6 +1610,7 @@ async fn test_grpc_decode_playback() {
                     output_bits_per_sample: 16,
                     output_channels: 1,
                 }),
+                new_segment: false,
             })
             .await;
     });
