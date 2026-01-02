@@ -82,3 +82,7 @@ path = "tests/integration.rs"
 [[bin]]
 name = "load_test"
 path = "benches/load_test.rs"
+
+[[test]]
+name = "opus_bench"
+path = "tests/opus_bench.rs"
