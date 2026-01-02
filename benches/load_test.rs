@@ -348,7 +348,8 @@ fn estimate_audio_duration(format: &str, file_size: usize) -> f64 {
         "opus" => 16.0,       // Raw opus typically ~16 kbps VBR
         "ogg_opus" => 110.0,  // Ogg container with higher quality settings ~110 kbps
         "webm" => 64.0,       // WebM with Opus audio
-        "mac_aac" => 64.0,
+        "mac_aac" => 64.0,    // M4A container with AAC
+        "aac_adts" => 64.0,   // Raw AAC ADTS stream
         "wav_24" | "wav_32f" | "wav_stereo" => 768.0,
         "linear16" => 256.0,
         "linear16_48" => 768.0,
@@ -802,6 +803,7 @@ async fn main() {
         "ogg_opus",
         "webm",
         "mac_aac",
+        "aac_adts",
         "wav_stereo",
         "wav_24",
         "wav_32f",
