@@ -4,6 +4,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use structopt::StructOpt;
 use tls_helpers::tls_acceptor_from_base64;
+use tokio_util::sync::CancellationToken;
 use tonic::transport::Server as TonicServer;
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
@@ -157,7 +158,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             output_channels: args.default_output_channels,
         };
 
-        let grpc_service = GrpcDecodeService::new(grpc_decoder_pool, grpc_decode_options);
+        // Create cancellation token for graceful shutdown of active streams
+        let grpc_cancel_token = CancellationToken::new();
+        let grpc_cancel_token_clone = grpc_cancel_token.clone();
+
+        let grpc_service =
+            GrpcDecodeService::new(grpc_decoder_pool, grpc_decode_options, grpc_cancel_token);
 
         let mut grpc_shutdown_rx = shutdown_rx.clone();
         tokio::spawn(async move {
@@ -166,11 +172,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .add_service(grpc_service.into_server())
                 .serve_with_shutdown(grpc_addr, async move {
                     let _ = grpc_shutdown_rx.changed().await;
+                    // Cancel all active streams when shutdown signal received
+                    grpc_cancel_token_clone.cancel();
+                    info!("gRPC shutdown signal received, cancelling active streams");
                 })
                 .await
             {
                 tracing::error!("gRPC server error: {}", e);
             }
+            info!("gRPC server stopped");
         });
 
         info!("gRPC decode server started on port {}", args.grpc_port);
