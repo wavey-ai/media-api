@@ -1,4 +1,4 @@
-use crate::pool::DecoderPool;
+use crate::pool::{DecoderPool, PooledDecoder};
 use bytes::Bytes;
 use futures_util::StreamExt;
 use soundkit_decoder::DecodeOptions;
@@ -40,34 +40,42 @@ impl GrpcDecodeService {
     pub fn into_server(self) -> DecodeServiceServer<Self> {
         DecodeServiceServer::new(self)
     }
+}
 
-    fn merge_options(&self, opts: Option<decode::DecodeOptions>) -> DecodeOptions {
-        match opts {
-            Some(o) => DecodeOptions {
-                output_sample_rate: if o.output_sample_rate > 0 {
-                    Some(o.output_sample_rate)
-                } else {
-                    self.default_options.output_sample_rate
-                },
-                output_bits_per_sample: if o.output_bits_per_sample > 0 {
-                    Some(o.output_bits_per_sample as u8)
-                } else {
-                    self.default_options.output_bits_per_sample
-                },
-                output_channels: if o.output_channels > 0 {
-                    Some(o.output_channels as u8)
-                } else {
-                    self.default_options.output_channels
-                },
-            },
-            None => self.default_options.clone(),
+/// Collect all remaining output from a decoder synchronously
+fn drain_decoder_sync(decoder: &PooledDecoder) -> Vec<Vec<u8>> {
+    // Signal EOF
+    let _ = decoder.send(Bytes::new());
+
+    // Collect remaining output
+    let mut pcm_chunks = Vec::new();
+    let mut tries = 0;
+    loop {
+        match decoder.try_recv() {
+            Ok(Some(Ok(audio_data))) => {
+                pcm_chunks.push(audio_data.data().to_vec());
+                tries = 0;
+            }
+            Ok(Some(Err(e))) => {
+                warn!("Decode error during flush: {}", e);
+            }
+            Ok(None) => {
+                tries += 1;
+                if tries > 10 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_micros(100));
+            }
+            Err(()) => break,
         }
     }
+    pcm_chunks
 }
 
 #[tonic::async_trait]
 impl DecodeService for GrpcDecodeService {
-    type DecodeStream = Pin<Box<dyn futures_util::Stream<Item = Result<DecodeResponse, Status>> + Send>>;
+    type DecodeStream =
+        Pin<Box<dyn futures_util::Stream<Item = Result<DecodeResponse, Status>> + Send>>;
 
     async fn decode(
         &self,
@@ -75,37 +83,18 @@ impl DecodeService for GrpcDecodeService {
     ) -> Result<Response<Self::DecodeStream>, Status> {
         let mut input_stream = request.into_inner();
 
-        // Read first message to get options
-        let first_msg = input_stream
-            .next()
-            .await
-            .ok_or_else(|| Status::invalid_argument("Empty request stream"))?
-            .map_err(|e| Status::internal(format!("Stream error: {}", e)))?;
-
-        let options = self.merge_options(first_msg.options);
-
-        // Acquire decoder from pool
-        let decoder = self
-            .decoder_pool
-            .acquire(options)
-            .map_err(|e| Status::resource_exhausted(format!("Failed to acquire decoder: {}", e)))?;
-
         // Create output channel
         let (tx, rx) = mpsc::channel::<Result<DecodeResponse, Status>>(32);
 
-        // Send first chunk if present
-        if !first_msg.data.is_empty() {
-            if let Err(e) = decoder.send(Bytes::from(first_msg.data)) {
-                return Err(Status::internal(format!("Decoder send error: {}", e)));
-            }
-        }
-
-        // Clone the shutdown token for the spawned task
+        let decoder_pool = self.decoder_pool.clone();
+        let default_options = self.default_options.clone();
         let shutdown_token = self.shutdown_token.clone();
 
-        // Spawn task to handle decoding
+        // Spawn task to handle decoding with support for multiple segments
         tokio::spawn(async move {
-            // Process input stream with shutdown monitoring
+            let mut current_decoder: Option<PooledDecoder> = None;
+            let mut current_options = default_options.clone();
+
             loop {
                 tokio::select! {
                     _ = shutdown_token.cancelled() => {
@@ -114,36 +103,105 @@ impl DecodeService for GrpcDecodeService {
                     }
                     chunk_result = input_stream.next() => {
                         match chunk_result {
-                            Some(Ok(chunk)) => {
-                                if !chunk.data.is_empty() {
-                                    if let Err(e) = decoder.send(Bytes::from(chunk.data)) {
-                                        warn!("Decoder send error: {}", e);
-                                        break;
+                            Some(Ok(msg)) => {
+                                // Check if this starts a new segment
+                                if msg.new_segment || current_decoder.is_none() {
+                                    // Drain current decoder if exists (sync collect, then async send)
+                                    let chunks = if let Some(decoder) = current_decoder.take() {
+                                        drain_decoder_sync(&decoder)
+                                    } else {
+                                        Vec::new()
+                                    };
+                                    for pcm in chunks {
+                                        if tx.send(Ok(DecodeResponse {
+                                            content: Some(Content::PcmData(pcm)),
+                                        })).await.is_err() {
+                                            return;
+                                        }
+                                    }
+
+                                    // Update options if provided
+                                    if msg.options.is_some() {
+                                        current_options = match msg.options {
+                                            Some(o) => DecodeOptions {
+                                                output_sample_rate: if o.output_sample_rate > 0 {
+                                                    Some(o.output_sample_rate)
+                                                } else {
+                                                    default_options.output_sample_rate
+                                                },
+                                                output_bits_per_sample: if o.output_bits_per_sample > 0 {
+                                                    Some(o.output_bits_per_sample as u8)
+                                                } else {
+                                                    default_options.output_bits_per_sample
+                                                },
+                                                output_channels: if o.output_channels > 0 {
+                                                    Some(o.output_channels as u8)
+                                                } else {
+                                                    default_options.output_channels
+                                                },
+                                            },
+                                            None => default_options.clone(),
+                                        };
+                                    }
+
+                                    // Acquire new decoder
+                                    match decoder_pool.acquire(current_options.clone()) {
+                                        Ok(decoder) => {
+                                            current_decoder = Some(decoder);
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to acquire decoder: {}", e);
+                                            let _ = tx.send(Err(Status::resource_exhausted(
+                                                format!("Failed to acquire decoder: {}", e)
+                                            ))).await;
+                                            return;
+                                        }
                                     }
                                 }
 
-                                // Drain available output
-                                loop {
-                                    match decoder.try_recv() {
-                                        Ok(Some(Ok(audio_data))) => {
-                                            // Send PCM data
-                                            if tx
-                                                .send(Ok(DecodeResponse {
-                                                    content: Some(Content::PcmData(
-                                                        audio_data.data().to_vec(),
-                                                    )),
-                                                }))
-                                                .await
-                                                .is_err()
-                                            {
-                                                return;
+                                // Send data to decoder and collect output
+                                if current_decoder.is_some() {
+                                    let decoder = current_decoder.as_ref().unwrap();
+
+                                    // Send input
+                                    if !msg.data.is_empty() {
+                                        if let Err(e) = decoder.send(Bytes::from(msg.data)) {
+                                            warn!("Decoder send error: {}", e);
+                                            current_decoder = None;
+                                            continue;
+                                        }
+                                    }
+
+                                    // Collect available output synchronously
+                                    let mut pcm_chunks = Vec::new();
+                                    let mut decoder_closed = false;
+                                    loop {
+                                        match decoder.try_recv() {
+                                            Ok(Some(Ok(audio_data))) => {
+                                                pcm_chunks.push(audio_data.data().to_vec());
+                                            }
+                                            Ok(Some(Err(e))) => {
+                                                warn!("Decode error: {}", e);
+                                            }
+                                            Ok(None) => break,
+                                            Err(()) => {
+                                                decoder_closed = true;
+                                                break;
                                             }
                                         }
-                                        Ok(Some(Err(e))) => {
-                                            warn!("Decode error: {}", e);
+                                    }
+
+                                    // Send collected chunks
+                                    for pcm in pcm_chunks {
+                                        if tx.send(Ok(DecodeResponse {
+                                            content: Some(Content::PcmData(pcm)),
+                                        })).await.is_err() {
+                                            return;
                                         }
-                                        Ok(None) => break,
-                                        Err(()) => break,
+                                    }
+
+                                    if decoder_closed {
+                                        current_decoder = None;
                                     }
                                 }
                             }
@@ -152,7 +210,7 @@ impl DecodeService for GrpcDecodeService {
                                 break;
                             }
                             None => {
-                                // Stream ended normally
+                                // Stream ended - drain final decoder
                                 break;
                             }
                         }
@@ -160,63 +218,15 @@ impl DecodeService for GrpcDecodeService {
                 }
             }
 
-            // Signal EOF and drain remaining output
-            let _ = decoder.send(Bytes::new());
-
-            // Drain with timeout to respect shutdown
-            loop {
-                if shutdown_token.is_cancelled() {
-                    info!("gRPC decode flush cancelled due to shutdown");
-                    return;
-                }
-
-                // Use try_recv in a loop with a small sleep instead of blocking recv
-                match decoder.try_recv() {
-                    Ok(Some(Ok(audio_data))) => {
-                        if tx
-                            .send(Ok(DecodeResponse {
-                                content: Some(Content::PcmData(audio_data.data().to_vec())),
-                            }))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
+            // Drain final decoder
+            if current_decoder.is_some() {
+                let chunks = drain_decoder_sync(current_decoder.as_ref().unwrap());
+                for pcm in chunks {
+                    if tx.send(Ok(DecodeResponse {
+                        content: Some(Content::PcmData(pcm)),
+                    })).await.is_err() {
+                        return;
                     }
-                    Ok(Some(Err(e))) => {
-                        warn!("Decode error during flush: {}", e);
-                    }
-                    Ok(None) => {
-                        // No data available, wait a bit and check if decoder is done
-                        tokio::time::sleep(tokio::time::Duration::from_micros(100)).await;
-                        // Check again with blocking recv to see if decoder is finished
-                        match decoder.try_recv() {
-                            Ok(None) => {
-                                // Still nothing, check if decoder worker is done
-                                tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
-                                if decoder.try_recv().is_err() {
-                                    // Decoder channel closed, we're done
-                                    break;
-                                }
-                            }
-                            Ok(Some(Ok(audio_data))) => {
-                                if tx
-                                    .send(Ok(DecodeResponse {
-                                        content: Some(Content::PcmData(audio_data.data().to_vec())),
-                                    }))
-                                    .await
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                            Ok(Some(Err(e))) => {
-                                warn!("Decode error during flush: {}", e);
-                            }
-                            Err(()) => break,
-                        }
-                    }
-                    Err(()) => break, // Decoder finished
                 }
             }
         });

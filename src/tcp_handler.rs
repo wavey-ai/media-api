@@ -165,7 +165,6 @@ impl TcpDecodeServer {
                     None => {
                         // EOF - signal decoder and end
                         let _ = decoder.send(Bytes::new());
-                        session_done = true;
                         break;
                     }
                 };

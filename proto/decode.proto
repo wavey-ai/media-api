@@ -14,8 +14,12 @@ message DecodeRequest {
   // Encoded audio bytes (MP3, FLAC, AAC, Opus, etc.)
   bytes data = 1;
 
-  // Optional decode options (only need to be set on first message)
+  // Optional decode options (set on first message or when starting new segment)
   DecodeOptions options = 2;
+
+  // Signal start of new audio segment - flushes current decoder and starts fresh
+  // Use this to decode multiple files over a single persistent stream
+  bool new_segment = 3;
 }
 
 // Decode options

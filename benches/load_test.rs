@@ -259,6 +259,7 @@ impl FormatStats {
 }
 
 #[derive(Debug)]
+#[allow(dead_code)]
 struct FormatResult {
     format: String,
     requests: usize,
@@ -273,6 +274,7 @@ struct FormatResult {
     throughput_buckets: Vec<(u64, f64)>,
 }
 
+#[allow(dead_code)]
 impl FormatResult {
     fn realtime_multiplier(&self) -> f64 {
         if self.wallclock_seconds > 0.0 {
@@ -397,6 +399,7 @@ async fn run_format_benchmark(
 // Throughput Graph
 // =============================================================================
 
+#[allow(dead_code)]
 fn print_throughput_graph(results: &[FormatResult]) {
     println!();
     println!("╔══════════════════════════════════════════════════════════════════════════════════╗");
