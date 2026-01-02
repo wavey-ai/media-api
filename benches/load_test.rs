@@ -11,12 +11,15 @@ use bytes::Bytes;
 use media_api::{MediaApiConfig, MediaRouter};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use web_service::h2::Http2Server;
+
+const OUTPUT_DIR: &str = "load_test_outputs";
 
 // =============================================================================
 // Configuration
@@ -581,6 +584,8 @@ async fn run_format_benchmark_with_autoscale(
     abort_flag: Arc<AtomicBool>,
 ) -> FormatResult {
     let stats = Arc::new(FormatStats::new());
+    let sample_saved = Arc::new(AtomicBool::new(false));
+    let format_for_save = format.to_string();
 
     // Warmup with initial concurrency
     let warmup_sem = Arc::new(Semaphore::new(INITIAL_CONCURRENCY));
@@ -650,6 +655,9 @@ async fn run_format_benchmark_with_autoscale(
         let active_req = active_requests.clone();
         let concurrency_tracker = current_concurrency.clone();
 
+        let sample_saved = sample_saved.clone();
+        let format_for_save = format_for_save.clone();
+
         let handle = tokio::spawn(async move {
             let req_start = Instant::now();
             let input_bytes = file.data.len();
@@ -665,6 +673,19 @@ async fn run_format_benchmark_with_autoscale(
                     stats.record_success(input_bytes, output.len(), file.estimated_duration, latency, req_concurrency);
                     let mut mon = monitor.lock().await;
                     mon.record_sample(&format, latency_ms, file.estimated_duration, true);
+
+                    // Save one sample output per format
+                    if !sample_saved.swap(true, Ordering::SeqCst) && !output.is_empty() {
+                        let out_dir = PathBuf::from(OUTPUT_DIR);
+                        if let Err(e) = fs::create_dir_all(&out_dir) {
+                            eprintln!("Failed to create output dir: {}", e);
+                        } else {
+                            let out_path = out_dir.join(format!("{}.s16le", format_for_save));
+                            if let Ok(mut f) = fs::File::create(&out_path) {
+                                let _ = f.write_all(&output);
+                            }
+                        }
+                    }
                 }
                 Err(_) => {
                     stats.record_failure(req_concurrency);
@@ -772,14 +793,23 @@ async fn main() {
     println!("╚══════════════════════════════════════════════════════════════════════════════════╝");
     println!();
 
-    // Note: FLAC excluded due to soundkit-flac release-mode bug (FFI issue)
-    // See: soundkit-flac tests fail in release mode but pass in debug mode
+    // FLAC now uses claxon (pure Rust) decoder to avoid libFLAC FFI release-mode bug
     let formats: Vec<&str> = vec![
         "mp3",
+        "flac",
         "opus",
         "ogg_opus",
         "mac_aac",
     ];
+
+    // Clear and create output directory for sample files
+    let output_dir = PathBuf::from(OUTPUT_DIR);
+    if output_dir.exists() {
+        let _ = fs::remove_dir_all(&output_dir);
+    }
+    fs::create_dir_all(&output_dir).expect("Failed to create output directory");
+    println!("Output samples will be saved to: {}/", OUTPUT_DIR);
+    println!();
 
     // Load test data
     println!("Loading test data...");
