@@ -347,6 +347,7 @@ fn estimate_audio_duration(format: &str, file_size: usize) -> f64 {
         "flac" => 400.0,
         "opus" => 16.0,       // Raw opus typically ~16 kbps VBR
         "ogg_opus" => 110.0,  // Ogg container with higher quality settings ~110 kbps
+        "webm" => 64.0,       // WebM with Opus audio
         "mac_aac" => 64.0,
         "wav_24" | "wav_32f" | "wav_stereo" => 768.0,
         "linear16" => 256.0,
@@ -799,7 +800,11 @@ async fn main() {
         "flac",
         "opus",
         "ogg_opus",
+        "webm",
         "mac_aac",
+        "wav_stereo",
+        "wav_24",
+        "wav_32f",
     ];
 
     // Clear and create output directory for sample files
