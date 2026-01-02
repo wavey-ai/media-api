@@ -43,6 +43,9 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 portpicker = "0.1"
 base64 = "0.22"
 
+# System info
+num_cpus = "1"
+
 [dev-dependencies]
 tokio-rustls = "0.26"
 rustls-pemfile = "2"

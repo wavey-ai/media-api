@@ -1,5 +1,7 @@
 use crate::config::MediaApiConfig;
-use crate::decode::{create_pipeline, parse_decode_options};
+use crate::decode::parse_decode_options;
+use crate::pool::DecoderPool;
+use crate::stats::Stats;
 use async_trait::async_trait;
 use bytes::Bytes;
 use frame_header::EncodingFlag;
@@ -9,29 +11,31 @@ use serde_json::json;
 use soundkit_decoder::DecodeOptions;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Semaphore;
 use web_service::{
     BodyStream, HandlerResponse, HandlerResult, Router, ServerError, StreamWriter,
     WebSocketHandler, WebTransportHandler,
 };
 
-/// Maximum concurrent decode operations to prevent resource exhaustion
-const MAX_CONCURRENT_DECODES: usize = 200;
-
 pub struct MediaRouter {
     config: Arc<MediaApiConfig>,
-    /// Semaphore to limit concurrent decode operations
-    /// Each decode gets a fresh decoder - the semaphore ensures we don't
-    /// overwhelm the system with too many concurrent decoder threads
-    decode_semaphore: Arc<Semaphore>,
+    /// Pool of decoder worker threads
+    /// Workers are pre-spawned and wait for jobs - no thread spawn per request
+    decoder_pool: Arc<DecoderPool>,
+    /// Connection statistics for monitoring
+    stats: Arc<Stats>,
 }
 
 impl MediaRouter {
     pub fn new(config: MediaApiConfig) -> Self {
         let config = Arc::new(config);
+        let stats = Arc::new(Stats::new());
+        // Pool size = 2x CPUs: always have workers ready, one in reserve
+        // Max concurrent = num_cpus (pool's bounded channel provides backpressure)
+        let pool_size = stats.num_cpus() * 2;
         Self {
             config,
-            decode_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
+            decoder_pool: Arc::new(DecoderPool::new(pool_size)),
+            stats,
         }
     }
 
@@ -65,47 +69,68 @@ impl MediaRouter {
         })
     }
 
+    async fn handle_stats(&self) -> HandlerResult<HandlerResponse> {
+        let body = self.stats.to_json();
+
+        Ok(HandlerResponse {
+            status: StatusCode::OK,
+            body: Some(Bytes::from(body.to_string())),
+            content_type: Some("application/json".to_string()),
+            headers: vec![],
+            etag: None,
+        })
+    }
+
     async fn handle_decode(
         &self,
         req: Request<()>,
         mut body: BodyStream,
     ) -> HandlerResult<HandlerResponse> {
-        // Acquire a decode slot from the pool - this ensures we don't create
-        // too many concurrent decoder threads which can exhaust system resources
-        let _permit = self.decode_semaphore.acquire().await.map_err(|_| {
-            ServerError::Handler(Box::new(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "Decoder pool exhausted",
-            )))
-        })?;
+        // Track connection for stats
+        self.stats.connection_start();
+        let stats = self.stats.clone();
+
+        // Ensure we track connection end even on early returns
+        struct ConnectionGuard(Arc<Stats>);
+        impl Drop for ConnectionGuard {
+            fn drop(&mut self) {
+                self.0.connection_end();
+            }
+        }
+        let _guard = ConnectionGuard(stats);
 
         let query = req.uri().query();
         let query_options = parse_decode_options(query);
         let options = self.merge_options(query_options);
 
-        // Create a fresh pipeline for this request - each request gets its own
-        // decoder instance to ensure complete state isolation
-        let mut pipeline = create_pipeline(options);
+        // Acquire a decoder from the pool - blocks if all workers are busy
+        // This provides natural backpressure without reading body into memory
+        let decoder = self.decoder_pool.acquire(options).map_err(|e| {
+            ServerError::Handler(Box::new(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                e,
+            )))
+        })?;
 
         // Collect all decoded output
         let mut output_bytes = Vec::new();
         let mut first_frame_info: Option<(u32, u8, u8, EncodingFlag)> = None;
 
-        // Feed input chunks to pipeline
+        // Feed input chunks to decoder
         while let Some(chunk_result) = body.next().await {
             match chunk_result {
                 Ok(chunk) => {
                     if chunk.is_empty() {
                         continue;
                     }
-                    if let Err(e) = pipeline.send(chunk) {
-                        tracing::warn!("Pipeline send error: {}", e);
+                    if let Err(e) = decoder.send(chunk) {
+                        tracing::warn!("Decoder send error: {}", e);
                         break;
                     }
                     // Drain any available output while we're feeding
-                    while let Some(output) = pipeline.try_recv() {
-                        match output {
-                            Ok(audio_data) => {
+                    loop {
+                        match decoder.try_recv() {
+                            Ok(Some(Ok(audio_data))) => {
                                 if first_frame_info.is_none() {
                                     first_frame_info = Some((
                                         audio_data.sampling_rate(),
@@ -116,9 +141,11 @@ impl MediaRouter {
                                 }
                                 output_bytes.extend_from_slice(audio_data.data());
                             }
-                            Err(e) => {
+                            Ok(Some(Err(e))) => {
                                 tracing::warn!("Decode error: {}", e);
                             }
+                            Ok(None) => break, // No data ready
+                            Err(()) => break,  // Channel closed
                         }
                     }
                 }
@@ -130,19 +157,18 @@ impl MediaRouter {
         }
 
         // Signal EOF and drain remaining output
-        let _ = pipeline.send(Bytes::new());
+        let _ = decoder.send(Bytes::new());
 
-        // Wait for remaining output with timeout
+        // Wait for decoder to finish - it will close the channel when done
         let start = std::time::Instant::now();
         let timeout = Duration::from_secs(5);
-        let mut idle_count = 0;
         loop {
             if start.elapsed() > timeout {
+                tracing::warn!("Decoder flush timeout");
                 break;
             }
-            match pipeline.try_recv() {
-                Some(Ok(audio_data)) => {
-                    idle_count = 0;
+            match decoder.try_recv() {
+                Ok(Some(Ok(audio_data))) => {
                     if first_frame_info.is_none() {
                         first_frame_info = Some((
                             audio_data.sampling_rate(),
@@ -153,17 +179,16 @@ impl MediaRouter {
                     }
                     output_bytes.extend_from_slice(audio_data.data());
                 }
-                Some(Err(e)) => {
-                    idle_count = 0;
+                Ok(Some(Err(e))) => {
                     tracing::warn!("Decode error during flush: {}", e);
                 }
-                None => {
-                    idle_count += 1;
-                    // Wait longer for decoder to process
-                    if idle_count > 100 {
-                        break;
-                    }
-                    tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok(None) => {
+                    // No data ready yet, yield briefly
+                    tokio::time::sleep(Duration::from_micros(100)).await;
+                }
+                Err(()) => {
+                    // Channel closed - decoder finished!
+                    break;
                 }
             }
         }
@@ -212,6 +237,7 @@ impl Router for MediaRouter {
 
         match path {
             "/status" | "/health" => self.handle_status().await,
+            "/stats" => self.handle_stats().await,
             _ => Ok(HandlerResponse {
                 status: StatusCode::NOT_FOUND,
                 body: Some(Bytes::from(
