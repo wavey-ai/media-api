@@ -14,7 +14,7 @@ use web_service::ServerConfig;
 #[derive(Debug, StructOpt)]
 #[structopt(name = "media-api", about = "Streaming audio decode API service")]
 struct Command {
-    #[structopt(long, default_value = "8443", env = "PORT")]
+    #[structopt(long, default_value = "9443", env = "PORT")]
     port: u16,
 
     #[structopt(long, env = "TLS_CERT_BASE64", default_value = "")]
