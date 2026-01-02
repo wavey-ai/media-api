@@ -1,282 +1,240 @@
-use crate::config::MediaApiConfig;
-use crate::decode::create_pipeline;
-use async_trait::async_trait;
+use crate::pool::DecoderPool;
 use bytes::Bytes;
-use frame_header::{EncodingFlag, Endianness, FrameHeader};
+use frame_header::EncodingFlag;
 use soundkit_decoder::DecodeOptions;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use web_service::traits::RawStream;
-use web_service::{HandlerResult, RawTcpHandler, ServerError};
+use std::time::Duration;
+use tcp_changes::framing::{read_frame, write_frame, tags};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_rustls::TlsAcceptor;
+use tracing::{error, info, warn};
 
-pub struct DecodeTcpHandler {
-    config: Arc<MediaApiConfig>,
+/// TCP decode server using tcp-changes framing protocol.
+///
+/// Wire format: [4B length][4B tag][data]
+/// - DCOD: client sends encoded audio chunks
+/// - PCMS: server sends decoded PCM chunks
+/// - DONE: signals end of stream
+/// - META: audio metadata (sample_rate:u32, channels:u8, bits:u8)
+pub struct TcpDecodeServer {
+    decoder_pool: Arc<DecoderPool>,
+    options: DecodeOptions,
+    tls_acceptor: Option<TlsAcceptor>,
 }
 
-impl DecodeTcpHandler {
-    pub fn new(config: Arc<MediaApiConfig>) -> Self {
-        Self { config }
+impl TcpDecodeServer {
+    pub fn new(
+        decoder_pool: Arc<DecoderPool>,
+        options: DecodeOptions,
+        tls_acceptor: Option<TlsAcceptor>,
+    ) -> Self {
+        Self {
+            decoder_pool,
+            options,
+            tls_acceptor,
+        }
     }
-}
 
-#[async_trait]
-impl RawTcpHandler for DecodeTcpHandler {
-    async fn handle_stream(
-        &self,
-        mut stream: Box<dyn RawStream>,
-        _is_tls: bool,
-    ) -> HandlerResult<()> {
-        let options = DecodeOptions {
-            output_sample_rate: self.config.default_output_sample_rate,
-            output_bits_per_sample: self.config.default_output_bits,
-            output_channels: self.config.default_output_channels,
-        };
-
-        let mut pipeline = create_pipeline(options);
-
-        // Read loop: read frame-header framed input
-        let mut header_buf = [0u8; 20]; // Max header size (4 + 8 + 8)
+    /// Start the TCP server on the given address.
+    pub async fn start(
+        self: Arc<Self>,
+        addr: std::net::SocketAddr,
+        mut shutdown: tokio::sync::watch::Receiver<()>,
+    ) -> std::io::Result<()> {
+        let listener = TcpListener::bind(addr).await?;
+        info!("TCP decode server listening on {}", addr);
 
         loop {
-            // Read the base header (4 bytes)
-            match stream.read_exact(&mut header_buf[..4]).await {
-                Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                    // EOF - signal pipeline and flush
-                    let _ = pipeline.send(Bytes::new());
+            tokio::select! {
+                result = listener.accept() => {
+                    match result {
+                        Ok((stream, peer)) => {
+                            let server = Arc::clone(&self);
+                            tokio::spawn(async move {
+                                if let Err(e) = server.handle_connection(stream, peer).await {
+                                    warn!("Connection error from {}: {}", peer, e);
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            error!("Accept error: {}", e);
+                        }
+                    }
+                }
+                _ = shutdown.changed() => {
+                    info!("TCP decode server shutting down");
                     break;
                 }
-                Err(e) => {
-                    tracing::error!("TCP read error: {}", e);
-                    return Err(ServerError::Handler(Box::new(e)));
-                }
             }
+        }
 
-            // Validate and decode header
-            let header = match FrameHeader::decode(&mut &header_buf[..4]) {
-                Ok(h) => h,
-                Err(e) => {
-                    tracing::warn!("Invalid frame header: {}", e);
-                    // Try to recover by reading raw data
-                    // For now, just continue
-                    continue;
+        Ok(())
+    }
+
+    async fn handle_connection(
+        &self,
+        stream: TcpStream,
+        peer: std::net::SocketAddr,
+    ) -> std::io::Result<()> {
+        info!("New TCP connection from {}", peer);
+
+        if let Some(ref acceptor) = self.tls_acceptor {
+            let tls_stream = acceptor.accept(stream).await?;
+            let (reader, writer) = tokio::io::split(tls_stream);
+            self.handle_decode_stream(reader, writer).await
+        } else {
+            let (reader, writer) = tokio::io::split(stream);
+            self.handle_decode_stream(reader, writer).await
+        }
+    }
+
+    async fn handle_decode_stream<R, W>(&self, mut reader: R, mut writer: W) -> std::io::Result<()>
+    where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        // Acquire decoder from pool
+        let decoder = self.decoder_pool.acquire(self.options.clone()).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::Other, e)
+        })?;
+
+        let mut first_meta_sent = false;
+
+        // Read frames from client
+        loop {
+            let frame = match read_frame(&mut reader).await? {
+                Some(f) => f,
+                None => {
+                    // EOF - signal decoder and flush
+                    let _ = decoder.send(Bytes::new());
+                    break;
                 }
             };
 
-            // Read optional ID and PTS if present
-            let mut extra_bytes = 0;
-            if header.id().is_some() {
-                extra_bytes += 8;
-            }
-            if header.pts().is_some() {
-                extra_bytes += 8;
-            }
-
-            if extra_bytes > 0 {
-                if let Err(e) = stream.read_exact(&mut header_buf[4..4 + extra_bytes]).await {
-                    tracing::error!("TCP read error (header extension): {}", e);
-                    return Err(ServerError::Handler(Box::new(e)));
-                }
-            }
-
-            // Calculate payload size
-            let bytes_per_sample = header.bits_per_sample() as usize / 8;
-            let payload_size =
-                header.sample_size() as usize * bytes_per_sample * header.channels() as usize;
-
-            if payload_size == 0 {
-                // EOF marker (zero-size frame)
-                let _ = pipeline.send(Bytes::new());
-                break;
-            }
-
-            // Read payload
-            let mut payload = vec![0u8; payload_size];
-            if let Err(e) = stream.read_exact(&mut payload).await {
-                if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    let _ = pipeline.send(Bytes::new());
+            if frame.tag_matches(tags::DCOD) {
+                // Send data to decoder
+                if frame.data.is_empty() {
+                    // Empty DCOD signals end of input
+                    let _ = decoder.send(Bytes::new());
                     break;
                 }
-                tracing::error!("TCP read error (payload): {}", e);
-                return Err(ServerError::Handler(Box::new(e)));
-            }
 
-            // Send to pipeline
-            if let Err(e) = pipeline.send(Bytes::from(payload)) {
-                tracing::warn!("Pipeline send error: {}", e);
-                break;
-            }
+                if let Err(e) = decoder.send(frame.data) {
+                    warn!("Decoder send error: {}", e);
+                    break;
+                }
 
-            // Drain and send output
-            while let Some(output) = pipeline.try_recv() {
-                match output {
-                    Ok(audio_data) => {
-                        if let Err(e) = write_audio_frame(&mut stream, &audio_data).await {
-                            tracing::error!("TCP write error: {}", e);
-                            return Err(e);
+                // Drain available output
+                loop {
+                    match decoder.try_recv() {
+                        Ok(Some(Ok(audio_data))) => {
+                            // Send metadata on first frame
+                            if !first_meta_sent {
+                                let encoding = match audio_data.audio_format() {
+                                    EncodingFlag::PCMFloat => PcmEncoding::Float,
+                                    _ => PcmEncoding::Signed,
+                                };
+                                let meta = encode_meta(
+                                    audio_data.sampling_rate(),
+                                    audio_data.channel_count(),
+                                    audio_data.bits_per_sample(),
+                                    encoding,
+                                );
+                                write_frame(&mut writer, tags::META, &meta).await?;
+                                first_meta_sent = true;
+                            }
+
+                            // Send PCM data
+                            write_frame(&mut writer, tags::PCMS, audio_data.data()).await?;
+                        }
+                        Ok(Some(Err(e))) => {
+                            warn!("Decode error: {}", e);
+                        }
+                        Ok(None) => break, // No more data ready
+                        Err(()) => {
+                            // Channel closed - decoder finished
+                            break;
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!("Decode error: {}", e);
-                    }
                 }
+            } else if frame.tag_matches(tags::DONE) {
+                // Client signaling end
+                let _ = decoder.send(Bytes::new());
+                break;
+            } else {
+                warn!("Unknown tag: {:?}", frame.tag);
             }
         }
 
-        // Flush remaining output
-        let timeout = std::time::Duration::from_secs(5);
-        let start = std::time::Instant::now();
-
+        // Flush remaining output using blocking recv - channel closes when done
         loop {
-            if start.elapsed() > timeout {
-                break;
-            }
-
-            match pipeline.try_recv() {
+            match decoder.recv() {
                 Some(Ok(audio_data)) => {
-                    if let Err(e) = write_audio_frame(&mut stream, &audio_data).await {
-                        tracing::error!("TCP write error during flush: {}", e);
-                        break;
+                    if !first_meta_sent {
+                        let encoding = match audio_data.audio_format() {
+                            EncodingFlag::PCMFloat => PcmEncoding::Float,
+                            _ => PcmEncoding::Signed,
+                        };
+                        let meta = encode_meta(
+                            audio_data.sampling_rate(),
+                            audio_data.channel_count(),
+                            audio_data.bits_per_sample(),
+                            encoding,
+                        );
+                        write_frame(&mut writer, tags::META, &meta).await?;
+                        first_meta_sent = true;
                     }
+                    write_frame(&mut writer, tags::PCMS, audio_data.data()).await?;
                 }
                 Some(Err(e)) => {
-                    tracing::warn!("Decode error during flush: {}", e);
+                    warn!("Decode error during flush: {}", e);
                 }
                 None => {
-                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    // Channel closed - decoder finished
+                    break;
                 }
             }
         }
 
-        // Send EOF frame (zero-size)
-        let eof_header = FrameHeader::new(
-            EncodingFlag::PCMSigned,
-            0,
-            48000,
-            1,
-            16,
-            Endianness::LittleEndian,
-            None,
-            None,
-        )
-        .ok();
-
-        if let Some(header) = eof_header {
-            let mut buf = Vec::with_capacity(4);
-            if header.encode(&mut buf).is_ok() {
-                let _ = stream.write_all(&buf).await;
-            }
-        }
-
-        let _ = stream.flush().await;
+        // Send DONE signal
+        write_frame(&mut writer, tags::DONE, &[]).await?;
 
         Ok(())
     }
 }
 
-async fn write_audio_frame(
-    stream: &mut Box<dyn RawStream>,
-    audio_data: &soundkit::audio_types::AudioData,
-) -> HandlerResult<()> {
-    let sample_count = audio_data.data().len()
-        / (audio_data.bits_per_sample() as usize / 8)
-        / audio_data.channel_count() as usize;
-
-    // frame-header only supports up to 12-bit sample counts (0xFFF)
-    // For larger frames, we need to split them
-    let max_samples = 0xFFF;
-
-    if sample_count <= max_samples {
-        write_single_frame(stream, audio_data, sample_count as u16).await
-    } else {
-        // Split into multiple frames
-        let bytes_per_sample =
-            audio_data.bits_per_sample() as usize / 8 * audio_data.channel_count() as usize;
-        let data = audio_data.data();
-        let mut offset = 0;
-
-        while offset < data.len() {
-            let remaining_samples = (data.len() - offset) / bytes_per_sample;
-            let chunk_samples = remaining_samples.min(max_samples);
-            let chunk_bytes = chunk_samples * bytes_per_sample;
-
-            let header = FrameHeader::new(
-                audio_data.audio_format(),
-                chunk_samples as u16,
-                audio_data.sampling_rate(),
-                audio_data.channel_count(),
-                audio_data.bits_per_sample(),
-                Endianness::LittleEndian,
-                None,
-                None,
-            )
-            .map_err(|e| {
-                ServerError::Handler(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    e,
-                )))
-            })?;
-
-            let mut buf = Vec::with_capacity(header.size() + chunk_bytes);
-            header.encode(&mut buf).map_err(|e| {
-                ServerError::Handler(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    e,
-                )))
-            })?;
-            buf.extend_from_slice(&data[offset..offset + chunk_bytes]);
-
-            stream.write_all(&buf).await.map_err(|e| {
-                ServerError::Handler(Box::new(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    e,
-                )))
-            })?;
-
-            offset += chunk_bytes;
-        }
-
-        Ok(())
-    }
+/// Encoding type for PCM data
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PcmEncoding {
+    Signed = 0,
+    Float = 1,
 }
 
-async fn write_single_frame(
-    stream: &mut Box<dyn RawStream>,
-    audio_data: &soundkit::audio_types::AudioData,
-    sample_count: u16,
-) -> HandlerResult<()> {
-    let header = FrameHeader::new(
-        audio_data.audio_format(),
-        sample_count,
-        audio_data.sampling_rate(),
-        audio_data.channel_count(),
-        audio_data.bits_per_sample(),
-        Endianness::LittleEndian,
-        None,
-        None,
-    )
-    .map_err(|e| {
-        ServerError::Handler(Box::new(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            e,
-        )))
-    })?;
+/// Encode audio metadata: sample_rate (4 bytes) + channels (1 byte) + bits (1 byte) + encoding (1 byte)
+fn encode_meta(sample_rate: u32, channels: u8, bits: u8, encoding: PcmEncoding) -> [u8; 7] {
+    let mut buf = [0u8; 7];
+    buf[0..4].copy_from_slice(&sample_rate.to_be_bytes());
+    buf[4] = channels;
+    buf[5] = bits;
+    buf[6] = encoding as u8;
+    buf
+}
 
-    let mut buf = Vec::with_capacity(header.size() + audio_data.data().len());
-    header.encode(&mut buf).map_err(|e| {
-        ServerError::Handler(Box::new(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            e,
-        )))
-    })?;
-    buf.extend_from_slice(audio_data.data());
-
-    stream.write_all(&buf).await.map_err(|e| {
-        ServerError::Handler(Box::new(std::io::Error::new(
-            std::io::ErrorKind::BrokenPipe,
-            e,
-        )))
-    })?;
-
-    Ok(())
+/// Decode audio metadata
+#[allow(dead_code)]
+pub fn decode_meta(data: &[u8]) -> Option<(u32, u8, u8, PcmEncoding)> {
+    if data.len() < 7 {
+        return None;
+    }
+    let sample_rate = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+    let channels = data[4];
+    let bits = data[5];
+    let encoding = match data[6] {
+        0 => PcmEncoding::Signed,
+        1 => PcmEncoding::Float,
+        _ => PcmEncoding::Signed,
+    };
+    Some((sample_rate, channels, bits, encoding))
 }

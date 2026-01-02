@@ -9,4 +9,4 @@ pub use config::MediaApiConfig;
 pub use pool::DecoderPool;
 pub use router::MediaRouter;
 pub use stats::Stats;
-pub use tcp_handler::DecodeTcpHandler;
+pub use tcp_handler::TcpDecodeServer;

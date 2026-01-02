@@ -10,7 +10,6 @@ use http::{Request, StatusCode};
 use serde_json::json;
 use soundkit_decoder::DecodeOptions;
 use std::sync::Arc;
-use std::time::Duration;
 use web_service::{
     BodyStream, HandlerResponse, HandlerResult, Router, ServerError, StreamWriter,
     WebSocketHandler, WebTransportHandler,
@@ -159,16 +158,10 @@ impl MediaRouter {
         // Signal EOF and drain remaining output
         let _ = decoder.send(Bytes::new());
 
-        // Wait for decoder to finish - it will close the channel when done
-        let start = std::time::Instant::now();
-        let timeout = Duration::from_secs(5);
+        // Wait for decoder to finish using blocking recv - channel closes when done
         loop {
-            if start.elapsed() > timeout {
-                tracing::warn!("Decoder flush timeout");
-                break;
-            }
-            match decoder.try_recv() {
-                Ok(Some(Ok(audio_data))) => {
+            match decoder.recv() {
+                Some(Ok(audio_data)) => {
                     if first_frame_info.is_none() {
                         first_frame_info = Some((
                             audio_data.sampling_rate(),
@@ -179,14 +172,10 @@ impl MediaRouter {
                     }
                     output_bytes.extend_from_slice(audio_data.data());
                 }
-                Ok(Some(Err(e))) => {
+                Some(Err(e)) => {
                     tracing::warn!("Decode error during flush: {}", e);
                 }
-                Ok(None) => {
-                    // No data ready yet, yield briefly
-                    tokio::time::sleep(Duration::from_micros(100)).await;
-                }
-                Err(()) => {
+                None => {
                     // Channel closed - decoder finished!
                     break;
                 }

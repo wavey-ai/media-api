@@ -15,6 +15,9 @@ soundkit-decoder = { git = "https://github.com/wavey-ai/soundkit.git" }
 soundkit = { git = "https://github.com/wavey-ai/soundkit.git" }
 frame-header = { git = "https://github.com/wavey-ai/frame-header.git" }
 
+# TCP transport
+tcp-changes = { path = "../tcp-changes" }
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
@@ -46,8 +49,11 @@ base64 = "0.22"
 # System info
 num_cpus = "1"
 
-[dev-dependencies]
+# TLS for TCP streams
 tokio-rustls = "0.26"
+rustls = "0.23"
+
+[dev-dependencies]
 rustls-pemfile = "2"
 # HTTP/3 client for testing
 quinn = "0.11"

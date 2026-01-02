@@ -4,7 +4,7 @@ use soundkit_decoder::{DecodeOptions, DecodePipeline};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// A pool of decoder worker threads that process audio decode jobs.
 /// Workers are pre-spawned and wait for jobs, avoiding thread spawn overhead per request.
@@ -66,17 +66,10 @@ impl DecoderPool {
 
     /// Process a single decode job
     fn process_job(job: Job) {
-        let job_start = Instant::now();
-
         // Create decoder pipeline for this job
-        let pipeline_start = Instant::now();
         let mut pipeline = DecodePipeline::spawn_with_options(job.options);
-        let pipeline_create_ms = pipeline_start.elapsed().as_millis();
 
         let mut input_done = false;
-        let mut total_input_bytes = 0usize;
-        let mut total_output_bytes = 0usize;
-        let process_start = Instant::now();
 
         // Process until input is exhausted and output is drained
         loop {
@@ -89,8 +82,10 @@ impl DecoderPool {
                             let _ = pipeline.send(Bytes::new());
                             input_done = true;
                         } else {
-                            total_input_bytes += chunk.len();
-                            let _ = pipeline.send(chunk);
+                            // Retry if buffer is full - don't drop data!
+                            while pipeline.send(chunk.clone()).is_err() {
+                                std::thread::sleep(Duration::from_micros(100));
+                            }
                         }
                     }
                     Err(TryRecvError::Empty) => {
@@ -105,12 +100,7 @@ impl DecoderPool {
             }
 
             // Drain available output
-            let mut had_output = false;
             while let Some(result) = pipeline.try_recv() {
-                had_output = true;
-                if let Ok(ref audio) = result {
-                    total_output_bytes += audio.data().len();
-                }
                 let mapped = result.map_err(|e| e.to_string());
                 if job.output_tx.send(mapped).is_err() {
                     // Output receiver dropped, abort
@@ -118,51 +108,27 @@ impl DecoderPool {
                 }
             }
 
-            // Check if we're done
-            if input_done && !had_output {
-                // Give decoder a bit more time to flush
-                thread::sleep(Duration::from_millis(1));
-
-                // Final drain - reduced from 50*5ms=250ms to 10*1ms=10ms
-                let flush_start = Instant::now();
-                let mut idle_count = 0;
+            // Check if we're done - use blocking recv to drain remaining output
+            if input_done {
+                // Final drain using blocking recv - waits for pipeline worker to finish
                 loop {
-                    match pipeline.try_recv() {
+                    match pipeline.recv() {
                         Some(result) => {
-                            idle_count = 0;
-                            if let Ok(ref audio) = result {
-                                total_output_bytes += audio.data().len();
-                            }
                             let mapped = result.map_err(|e| e.to_string());
                             if job.output_tx.send(mapped).is_err() {
                                 return;
                             }
                         }
                         None => {
-                            idle_count += 1;
-                            if idle_count > 10 {
-                                // No more output after 10ms
-                                break;
-                            }
-                            thread::sleep(Duration::from_millis(1));
+                            // Pipeline worker finished - no more output
+                            break;
                         }
                     }
                 }
-                let flush_ms = flush_start.elapsed().as_millis();
-                let process_ms = process_start.elapsed().as_millis();
-                let total_ms = job_start.elapsed().as_millis();
-
-                // Debug timing (uncomment to enable)
-                // eprintln!(
-                //     "[POOL] pipeline_create={}ms process={}ms flush={}ms total={}ms input={}KB output={}KB",
-                //     pipeline_create_ms, process_ms, flush_ms, total_ms,
-                //     total_input_bytes / 1024, total_output_bytes / 1024
-                // );
-                let _ = (pipeline_create_ms, process_ms, flush_ms, total_ms, total_input_bytes, total_output_bytes);
                 break;
             }
 
-            // Small yield to avoid busy spinning
+            // Small yield to avoid busy spinning while waiting for input
             thread::sleep(Duration::from_micros(100));
         }
     }
@@ -211,6 +177,12 @@ impl PooledDecoder {
             Err(TryRecvError::Empty) => Ok(None),
             Err(TryRecvError::Disconnected) => Err(()), // Decoder finished
         }
+    }
+
+    /// Receive decoded output (blocking).
+    /// Returns Some(result) when data available, None when channel closed (decoder finished).
+    pub fn recv(&self) -> Option<Result<AudioData, String>> {
+        self.output_rx.recv().ok()
     }
 }
 
