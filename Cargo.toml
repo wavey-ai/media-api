@@ -16,7 +16,7 @@ soundkit = { git = "https://github.com/wavey-ai/soundkit.git" }
 frame-header = { git = "https://github.com/wavey-ai/frame-header.git" }
 
 # TCP transport
-tcp-changes = { path = "../tcp-changes" }
+tcp-changes = { git = "https://github.com/wavey-ai/tcp-changes.git" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
