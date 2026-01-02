@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use frame_header::EncodingFlag;
 use futures_util::StreamExt;
-use http::{Request, StatusCode};
+use http::{Request, Response, StatusCode};
 use serde_json::json;
 use soundkit_decoder::DecodeOptions;
 use std::sync::Arc;
@@ -80,11 +80,16 @@ impl MediaRouter {
         })
     }
 
-    async fn handle_decode(
+    /// Streaming decode handler - streams PCM output as audio is decoded.
+    /// Wire format:
+    /// - First 7 bytes: metadata (sample_rate:4, channels:1, bits:1, encoding:1)
+    /// - Remaining bytes: raw PCM data
+    async fn handle_decode_stream(
         &self,
         req: Request<()>,
         mut body: BodyStream,
-    ) -> HandlerResult<HandlerResponse> {
+        mut stream_writer: Box<dyn StreamWriter>,
+    ) -> HandlerResult<()> {
         // Track connection for stats
         self.stats.connection_start();
         let stats = self.stats.clone();
@@ -103,7 +108,6 @@ impl MediaRouter {
         let options = self.merge_options(query_options);
 
         // Acquire a decoder from the pool - blocks if all workers are busy
-        // This provides natural backpressure without reading body into memory
         let decoder = self.decoder_pool.acquire(options).map_err(|e| {
             ServerError::Handler(Box::new(std::io::Error::new(
                 std::io::ErrorKind::Other,
@@ -111,11 +115,16 @@ impl MediaRouter {
             )))
         })?;
 
-        // Collect all decoded output
-        let mut output_bytes = Vec::new();
-        let mut first_frame_info: Option<(u32, u8, u8, EncodingFlag)> = None;
+        // Send response headers immediately
+        let response = Response::builder()
+            .status(StatusCode::OK)
+            .body(())
+            .map_err(ServerError::Http)?;
+        stream_writer.send_response(response).await?;
 
-        // Feed input chunks to decoder
+        let mut first_meta_sent = false;
+
+        // Feed input chunks to decoder and stream output
         while let Some(chunk_result) = body.next().await {
             match chunk_result {
                 Ok(chunk) => {
@@ -126,19 +135,26 @@ impl MediaRouter {
                         tracing::warn!("Decoder send error: {}", e);
                         break;
                     }
-                    // Drain any available output while we're feeding
+                    // Drain any available output and stream it
                     loop {
                         match decoder.try_recv() {
                             Ok(Some(Ok(audio_data))) => {
-                                if first_frame_info.is_none() {
-                                    first_frame_info = Some((
+                                // Send metadata before first PCM chunk
+                                if !first_meta_sent {
+                                    let meta = encode_meta(
                                         audio_data.sampling_rate(),
                                         audio_data.channel_count(),
                                         audio_data.bits_per_sample(),
-                                        audio_data.audio_format(),
-                                    ));
+                                        match audio_data.audio_format() {
+                                            EncodingFlag::PCMFloat => PcmEncoding::Float,
+                                            _ => PcmEncoding::Signed,
+                                        },
+                                    );
+                                    stream_writer.send_data(Bytes::copy_from_slice(&meta)).await?;
+                                    first_meta_sent = true;
                                 }
-                                output_bytes.extend_from_slice(audio_data.data());
+                                // Stream PCM data
+                                stream_writer.send_data(Bytes::copy_from_slice(audio_data.data())).await?;
                             }
                             Ok(Some(Err(e))) => {
                                 tracing::warn!("Decode error: {}", e);
@@ -158,65 +174,52 @@ impl MediaRouter {
         // Signal EOF and drain remaining output
         let _ = decoder.send(Bytes::new());
 
-        // Wait for decoder to finish using blocking recv - channel closes when done
+        // Wait for decoder to finish using blocking recv
         loop {
             match decoder.recv() {
                 Some(Ok(audio_data)) => {
-                    if first_frame_info.is_none() {
-                        first_frame_info = Some((
+                    if !first_meta_sent {
+                        let meta = encode_meta(
                             audio_data.sampling_rate(),
                             audio_data.channel_count(),
                             audio_data.bits_per_sample(),
-                            audio_data.audio_format(),
-                        ));
+                            match audio_data.audio_format() {
+                                EncodingFlag::PCMFloat => PcmEncoding::Float,
+                                _ => PcmEncoding::Signed,
+                            },
+                        );
+                        stream_writer.send_data(Bytes::copy_from_slice(&meta)).await?;
+                        first_meta_sent = true;
                     }
-                    output_bytes.extend_from_slice(audio_data.data());
+                    stream_writer.send_data(Bytes::copy_from_slice(audio_data.data())).await?;
                 }
                 Some(Err(e)) => {
                     tracing::warn!("Decode error during flush: {}", e);
                 }
-                None => {
-                    // Channel closed - decoder finished!
-                    break;
-                }
+                None => break,
             }
         }
 
-        if output_bytes.is_empty() {
-            return Ok(HandlerResponse {
-                status: StatusCode::UNPROCESSABLE_ENTITY,
-                body: Some(Bytes::from(
-                    json!({"error": "Failed to decode audio"}).to_string(),
-                )),
-                content_type: Some("application/json".to_string()),
-                headers: vec![],
-                etag: None,
-            });
-        }
-
-        let mut headers = vec![];
-        if let Some((sample_rate, channels, bits, encoding)) = first_frame_info {
-            headers.push(("X-Sample-Rate".to_string(), sample_rate.to_string()));
-            headers.push(("X-Channels".to_string(), channels.to_string()));
-            headers.push(("X-Bits-Per-Sample".to_string(), bits.to_string()));
-            headers.push((
-                "X-Encoding".to_string(),
-                match encoding {
-                    EncodingFlag::PCMFloat => "pcm-float",
-                    _ => "pcm-signed",
-                }
-                .to_string(),
-            ));
-        }
-
-        Ok(HandlerResponse {
-            status: StatusCode::OK,
-            body: Some(Bytes::from(output_bytes)),
-            content_type: Some("application/octet-stream".to_string()),
-            headers,
-            etag: None,
-        })
+        stream_writer.finish().await
     }
+}
+
+/// Encoding type for PCM data
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PcmEncoding {
+    Signed = 0,
+    Float = 1,
+}
+
+/// Encode audio metadata: sample_rate (4 bytes) + channels (1 byte) + bits (1 byte) + encoding (1 byte)
+fn encode_meta(sample_rate: u32, channels: u8, bits: u8, encoding: PcmEncoding) -> [u8; 7] {
+    let mut buf = [0u8; 7];
+    buf[0..4].copy_from_slice(&sample_rate.to_be_bytes());
+    buf[4] = channels;
+    buf[5] = bits;
+    buf[6] = encoding as u8;
+    buf
 }
 
 #[async_trait]
@@ -239,25 +242,34 @@ impl Router for MediaRouter {
         }
     }
 
-    async fn route_body(
-        &self,
-        req: Request<()>,
-        body: BodyStream,
-    ) -> HandlerResult<HandlerResponse> {
-        let path = req.uri().path();
-
-        match path {
-            "/decode" => self.handle_decode(req, body).await,
-            _ => self.route(req).await,
-        }
-    }
-
-    fn has_body_handler(&self, path: &str) -> bool {
-        matches!(path, "/decode")
+    fn has_body_handler(&self, _path: &str) -> bool {
+        false
     }
 
     fn is_streaming(&self, _path: &str) -> bool {
         false
+    }
+
+    fn is_body_streaming(&self, path: &str) -> bool {
+        // /decode uses bidirectional streaming
+        path == "/decode"
+    }
+
+    async fn route_body_stream(
+        &self,
+        req: Request<()>,
+        body: BodyStream,
+        stream_writer: Box<dyn StreamWriter>,
+    ) -> HandlerResult<()> {
+        let path = req.uri().path();
+
+        match path {
+            "/decode" => self.handle_decode_stream(req, body, stream_writer).await,
+            _ => Err(ServerError::Handler(Box::new(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "Not found",
+            )))),
+        }
     }
 
     async fn route_stream(
