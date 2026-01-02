@@ -14,6 +14,7 @@ tls-helpers = { git = "https://github.com/wavey-ai/tls-helpers.git" }
 # Audio decoding
 soundkit-decoder = { git = "https://github.com/wavey-ai/soundkit.git" }
 soundkit = { git = "https://github.com/wavey-ai/soundkit.git" }
+access-unit = { git = "https://github.com/wavey-ai/access-unit.git" }
 frame-header = { git = "https://github.com/wavey-ai/frame-header.git" }
 
 # TCP transport

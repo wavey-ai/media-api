@@ -1,10 +1,12 @@
+use access_unit::{detect_audio, AudioType};
 use bytes::Bytes;
 use soundkit::audio_types::AudioData;
 use soundkit_decoder::{DecodeOptions, DecodePipeline};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tracing::info;
 
 /// A pool of decoder worker threads that process audio decode jobs.
 /// Workers are pre-spawned and wait for jobs, avoiding thread spawn overhead per request.
@@ -66,10 +68,18 @@ impl DecoderPool {
 
     /// Process a single decode job
     fn process_job(job: Job) {
+        let job_start = Instant::now();
+
         // Create decoder pipeline for this job
-        let mut pipeline = DecodePipeline::spawn_with_options(job.options);
+        let mut pipeline = DecodePipeline::spawn_with_options(job.options.clone());
 
         let mut input_done = false;
+        let mut input_bytes = 0usize;
+        let mut output_bytes = 0usize;
+        let mut output_sample_rate = 0u32;
+        let mut output_channels = 0u8;
+        let mut codec: Option<AudioType> = None;
+        let mut first_output_time: Option<Instant> = None;
 
         // Process until input is exhausted and output is drained
         loop {
@@ -82,6 +92,12 @@ impl DecoderPool {
                             let _ = pipeline.send(Bytes::new());
                             input_done = true;
                         } else {
+                            // Detect codec from first chunk
+                            if codec.is_none() && chunk.len() >= 12 {
+                                codec = Some(detect_audio(&chunk));
+                            }
+                            input_bytes += chunk.len();
+
                             // Retry if buffer is full - don't drop data!
                             while pipeline.send(chunk.clone()).is_err() {
                                 std::thread::sleep(Duration::from_micros(100));
@@ -101,6 +117,14 @@ impl DecoderPool {
 
             // Drain available output
             while let Some(result) = pipeline.try_recv() {
+                if first_output_time.is_none() {
+                    first_output_time = Some(Instant::now());
+                }
+                if let Ok(ref audio_data) = result {
+                    output_bytes += audio_data.data().len();
+                    output_sample_rate = audio_data.sampling_rate();
+                    output_channels = audio_data.channel_count();
+                }
                 let mapped = result.map_err(|e| e.to_string());
                 if job.output_tx.send(mapped).is_err() {
                     // Output receiver dropped, abort
@@ -114,6 +138,14 @@ impl DecoderPool {
                 loop {
                     match pipeline.recv() {
                         Some(result) => {
+                            if first_output_time.is_none() {
+                                first_output_time = Some(Instant::now());
+                            }
+                            if let Ok(ref audio_data) = result {
+                                output_bytes += audio_data.data().len();
+                                output_sample_rate = audio_data.sampling_rate();
+                                output_channels = audio_data.channel_count();
+                            }
                             let mapped = result.map_err(|e| e.to_string());
                             if job.output_tx.send(mapped).is_err() {
                                 return;
@@ -131,6 +163,43 @@ impl DecoderPool {
             // Small yield to avoid busy spinning while waiting for input
             thread::sleep(Duration::from_micros(100));
         }
+
+        // Log metrics
+        let total_time = job_start.elapsed();
+        let decoder_time = first_output_time
+            .map(|t| total_time - job_start.elapsed().saturating_sub(t.elapsed()))
+            .unwrap_or(total_time);
+
+        // Calculate audio duration from output
+        // bytes / (sample_rate * channels * bytes_per_sample)
+        let bytes_per_sample = job.options.output_bits_per_sample.unwrap_or(16) as usize / 8;
+        let audio_secs = if output_sample_rate > 0 && output_channels > 0 {
+            output_bytes as f64
+                / (output_sample_rate as f64 * output_channels as f64 * bytes_per_sample as f64)
+        } else {
+            0.0
+        };
+
+        let realtime_factor = if total_time.as_secs_f64() > 0.0 {
+            audio_secs / total_time.as_secs_f64()
+        } else {
+            0.0
+        };
+
+        let codec_name = codec
+            .map(|c| format!("{:?}", c))
+            .unwrap_or_else(|| "unknown".to_string());
+
+        info!(
+            codec = %codec_name,
+            audio_secs = format!("{:.2}", audio_secs),
+            realtime = format!("{:.1}x", realtime_factor),
+            input_kb = format!("{:.1}", input_bytes as f64 / 1024.0),
+            output_kb = format!("{:.1}", output_bytes as f64 / 1024.0),
+            decode_ms = format!("{:.1}", decoder_time.as_secs_f64() * 1000.0),
+            total_ms = format!("{:.1}", total_time.as_secs_f64() * 1000.0),
+            "decode complete"
+        );
     }
 
     /// Acquire a decoder from the pool.

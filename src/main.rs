@@ -53,9 +53,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load .env file
     let _ = dotenvy::dotenv();
 
-    // Initialize tracing
+    // Initialize tracing with filtered noisy crates
+    // Use RUST_LOG=h2=debug,tonic=debug,hyper=debug to enable verbose gRPC logs
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new("info")
+            .add_directive("h2=warn".parse().unwrap())
+            .add_directive("hyper=warn".parse().unwrap())
+            .add_directive("hyper_util=warn".parse().unwrap())
+            .add_directive("tonic=warn".parse().unwrap())
+            .add_directive("tower=warn".parse().unwrap())
+    });
     tracing_subscriber::registry()
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(filter)
         .with(tracing_subscriber::fmt::layer())
         .init();
 
