@@ -53,6 +53,14 @@ num_cpus = "1"
 tokio-rustls = "0.26"
 rustls = "0.23"
 
+# gRPC
+tonic = "0.12"
+prost = "0.13"
+tokio-stream = "0.1"
+
+[build-dependencies]
+tonic-build = "0.12"
+
 [dev-dependencies]
 rustls-pemfile = "2"
 # HTTP/3 client for testing

@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package decode;
+
+// Audio decoding service with bidirectional streaming
+service DecodeService {
+  // Decode audio stream - accepts encoded audio chunks, returns PCM chunks
+  // First response message contains metadata, subsequent messages contain PCM data
+  rpc Decode(stream DecodeRequest) returns (stream DecodeResponse);
+}
+
+// Request message containing encoded audio data
+message DecodeRequest {
+  // Encoded audio bytes (MP3, FLAC, AAC, Opus, etc.)
+  bytes data = 1;
+
+  // Optional decode options (only need to be set on first message)
+  DecodeOptions options = 2;
+}
+
+// Decode options
+message DecodeOptions {
+  // Target sample rate (0 = keep original)
+  uint32 output_sample_rate = 1;
+
+  // Target bits per sample (0 = keep original)
+  uint32 output_bits_per_sample = 2;
+
+  // Target number of channels (0 = keep original)
+  uint32 output_channels = 3;
+}
+
+// Response message containing decoded PCM data or metadata
+message DecodeResponse {
+  oneof content {
+    // Audio metadata - sent before first PCM chunk
+    AudioMetadata metadata = 1;
+
+    // Raw PCM audio data
+    bytes pcm_data = 2;
+  }
+}
+
+// Audio format metadata
+message AudioMetadata {
+  // Sample rate in Hz
+  uint32 sample_rate = 1;
+
+  // Number of audio channels
+  uint32 channels = 2;
+
+  // Bits per sample (16, 24, 32)
+  uint32 bits_per_sample = 3;
+
+  // PCM encoding type
+  PcmEncoding encoding = 4;
+}
+
+// PCM encoding format
+enum PcmEncoding {
+  PCM_SIGNED = 0;
+  PCM_FLOAT = 1;
+}

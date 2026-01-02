@@ -4,8 +4,11 @@
 //! for decoded output verification.
 
 use bytes::Bytes;
+use futures_util::StreamExt;
+use media_api::grpc::decode::decode_service_client::DecodeServiceClient;
+use media_api::grpc::decode::{DecodeOptions as GrpcDecodeOptions, DecodeRequest};
 use media_api::tcp_handler::decode_meta;
-use media_api::{DecoderPool, MediaApiConfig, MediaRouter, TcpDecodeServer};
+use media_api::{DecoderPool, GrpcDecodeService, MediaApiConfig, MediaRouter, TcpDecodeServer};
 use soundkit_decoder::DecodeOptions;
 use std::fs;
 use std::io::Write;
@@ -16,6 +19,8 @@ use std::time::Duration;
 use tcp_changes::framing::{read_frame, tags, write_frame};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
+use tokio_stream::wrappers::ReceiverStream;
+use tonic::transport::Server;
 use web_service::h2::Http2Server;
 use web_service::h3::Http3Server;
 
@@ -1391,6 +1396,266 @@ async fn test_aac_adts_concatenation() {
             -96.0
         }
     );
+    print_waveform(&result.waveform);
+
+    let _ = shutdown.send(());
+}
+
+// =============================================================================
+// gRPC Streaming Tests
+// =============================================================================
+
+/// Start a gRPC test server on a random port
+async fn start_grpc_server() -> (u16, tokio::sync::oneshot::Sender<()>) {
+    let port = portpicker::pick_unused_port().expect("No ports available");
+    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().unwrap();
+
+    let pool_size = 4;
+    let decoder_pool = Arc::new(DecoderPool::new(pool_size));
+    let default_options = DecodeOptions {
+        output_sample_rate: Some(16_000),
+        output_bits_per_sample: Some(16),
+        output_channels: Some(1),
+    };
+
+    let grpc_service = GrpcDecodeService::new(decoder_pool, default_options);
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(grpc_service.into_server())
+            .serve_with_shutdown(addr, async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .expect("gRPC server failed");
+    });
+
+    // Wait for server to start
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    (port, shutdown_tx)
+}
+
+#[tokio::test]
+async fn test_grpc_decode_streaming() {
+    println!("\n=== gRPC Bidirectional Streaming Decode Test ===\n");
+
+    let (port, shutdown) = start_grpc_server().await;
+    let addr = format!("http://127.0.0.1:{}", port);
+
+    // Connect to gRPC server
+    let mut client = DecodeServiceClient::connect(addr)
+        .await
+        .expect("Failed to connect to gRPC server");
+
+    println!("Testing gRPC streaming decode with all audio formats...\n");
+
+    for (format_name, file_path) in TEST_FORMATS {
+        let input_path = testdata_path(file_path);
+        if !input_path.exists() {
+            println!("  {} - skipped (file not found)", format_name);
+            continue;
+        }
+
+        let input_data = fs::read(&input_path).expect("Failed to read test file");
+        let input_size = input_data.len();
+
+        // Create request stream - send data in chunks
+        let (tx, rx) = tokio::sync::mpsc::channel::<DecodeRequest>(32);
+        let request_stream = ReceiverStream::new(rx);
+
+        // Spawn task to send chunks
+        let chunk_size = 4096;
+        tokio::spawn(async move {
+            // First message with options
+            let first_chunk = if input_data.len() > chunk_size {
+                input_data[..chunk_size].to_vec()
+            } else {
+                input_data.clone()
+            };
+
+            let _ = tx
+                .send(DecodeRequest {
+                    data: first_chunk,
+                    options: Some(GrpcDecodeOptions {
+                        output_sample_rate: 16000,
+                        output_bits_per_sample: 16,
+                        output_channels: 1,
+                    }),
+                })
+                .await;
+
+            // Send remaining chunks
+            let mut offset = chunk_size;
+            while offset < input_data.len() {
+                let end = std::cmp::min(offset + chunk_size, input_data.len());
+                let chunk = input_data[offset..end].to_vec();
+                if tx
+                    .send(DecodeRequest {
+                        data: chunk,
+                        options: None,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                offset = end;
+            }
+            // Drop tx to signal end of stream
+        });
+
+        // Send streaming request and collect response
+        let response = client
+            .decode(tonic::Request::new(request_stream))
+            .await
+            .expect("gRPC decode request failed");
+
+        let mut response_stream = response.into_inner();
+        let mut pcm_data = Vec::new();
+        let mut metadata_received = false;
+        let mut sample_rate = 0u32;
+        let mut channels = 0u32;
+        let mut bits = 0u32;
+
+        while let Some(msg) = response_stream.next().await {
+            match msg {
+                Ok(decode_response) => {
+                    if let Some(content) = decode_response.content {
+                        match content {
+                            media_api::grpc::decode::decode_response::Content::Metadata(meta) => {
+                                sample_rate = meta.sample_rate;
+                                channels = meta.channels;
+                                bits = meta.bits_per_sample;
+                                metadata_received = true;
+                            }
+                            media_api::grpc::decode::decode_response::Content::PcmData(data) => {
+                                pcm_data.extend_from_slice(&data);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("  {} - gRPC error: {}", format_name, e);
+                    break;
+                }
+            }
+        }
+
+        if pcm_data.is_empty() {
+            println!("  {} - FAILED (no PCM data received)", format_name);
+            continue;
+        }
+
+        // Analyze and display results
+        let result = analyze_pcm(&pcm_data, 16000, 1, 16);
+        let duration = result.bytes as f64 / 2.0 / 16000.0;
+        let db = if result.rms > 0.0 {
+            20.0 * result.rms.log10()
+        } else {
+            -96.0
+        };
+
+        println!(
+            "  {} - {} bytes in -> {} bytes out, {:.2}s, {:.1} dB, meta: {}Hz/{}ch/{}bit",
+            format_name,
+            input_size,
+            pcm_data.len(),
+            duration,
+            db,
+            sample_rate,
+            channels,
+            bits
+        );
+        print_waveform(&result.waveform);
+
+        assert!(
+            metadata_received,
+            "{} - No metadata received",
+            format_name
+        );
+        assert!(
+            duration > 0.5,
+            "{} - Duration too short: {:.2}s",
+            format_name,
+            duration
+        );
+    }
+
+    let _ = shutdown.send(());
+}
+
+#[tokio::test]
+async fn test_grpc_decode_playback() {
+    println!("\n=== gRPC Decode with Playback Test ===\n");
+
+    let (port, shutdown) = start_grpc_server().await;
+    let addr = format!("http://127.0.0.1:{}", port);
+
+    let mut client = DecodeServiceClient::connect(addr)
+        .await
+        .expect("Failed to connect to gRPC server");
+
+    // Use MP3 for playback test
+    let input_path = testdata_path("mp3/A_Tusk_is_used_to_make_costly_gifts.mp3");
+    if !input_path.exists() {
+        println!("  Skipping playback test - MP3 file not found");
+        let _ = shutdown.send(());
+        return;
+    }
+
+    let input_data = fs::read(&input_path).expect("Failed to read MP3 file");
+    println!("  Input: {} bytes MP3", input_data.len());
+
+    // Send entire file at once for simplicity
+    let (tx, rx) = tokio::sync::mpsc::channel::<DecodeRequest>(1);
+    let request_stream = ReceiverStream::new(rx);
+
+    tokio::spawn(async move {
+        let _ = tx
+            .send(DecodeRequest {
+                data: input_data,
+                options: Some(GrpcDecodeOptions {
+                    output_sample_rate: 16000,
+                    output_bits_per_sample: 16,
+                    output_channels: 1,
+                }),
+            })
+            .await;
+    });
+
+    let response = client
+        .decode(tonic::Request::new(request_stream))
+        .await
+        .expect("gRPC decode failed");
+
+    let mut response_stream = response.into_inner();
+    let mut pcm_data = Vec::new();
+
+    while let Some(msg) = response_stream.next().await {
+        if let Ok(decode_response) = msg {
+            if let Some(content) = decode_response.content {
+                if let media_api::grpc::decode::decode_response::Content::PcmData(data) = content {
+                    pcm_data.extend_from_slice(&data);
+                }
+            }
+        }
+    }
+
+    println!("  Output: {} bytes PCM (16kHz, mono, 16-bit)", pcm_data.len());
+
+    // Save to file for manual playback verification
+    let output_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("testdata")
+        .join("golden")
+        .join("grpc_mp3.s16le");
+    fs::write(&output_path, &pcm_data).expect("Failed to write output file");
+    println!("  Saved to: {:?}", output_path);
+    println!("  Play with: ffplay -f s16le -ar 16000 -ac 1 {:?}", output_path);
+
+    let result = analyze_pcm(&pcm_data, 16000, 1, 16);
     print_waveform(&result.waveform);
 
     let _ = shutdown.send(());
