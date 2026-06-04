@@ -14,6 +14,8 @@ tls-helpers = { git = "https://github.com/wavey-ai/tls-helpers.git" }
 # Audio decoding
 soundkit-decoder = { git = "https://github.com/wavey-ai/soundkit.git" }
 soundkit = { git = "https://github.com/wavey-ai/soundkit.git" }
+soundkit-opus = { git = "https://github.com/wavey-ai/soundkit.git", package = "soundkit-opus" }
+libopus = { git = "https://github.com/wavey-ai/opus-rs" }
 access-unit = { git = "https://github.com/wavey-ai/access-unit.git" }
 frame-header = { git = "https://github.com/wavey-ai/frame-header.git" }
 
@@ -72,6 +74,9 @@ h3 = { git = "https://github.com/hyperium/h3.git" }
 h3-quinn = { git = "https://github.com/hyperium/h3.git" }
 rustls = "0.23"
 
+[patch.crates-io]
+oxideav-speex = { git = "https://github.com/jbrough/oxideav-speex.git" }
+
 [[bin]]
 name = "media-api"
 path = "src/main.rs"
@@ -83,6 +88,10 @@ path = "tests/integration.rs"
 [[bin]]
 name = "load_test"
 path = "benches/load_test.rs"
+
+[[bin]]
+name = "opus_benchmark"
+path = "src/bin/opus_benchmark.rs"
 
 [[test]]
 name = "opus_bench"
