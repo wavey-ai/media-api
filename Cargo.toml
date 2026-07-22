@@ -1,6 +1,6 @@
 [package]
 name = "media-api"
-authors = ["Jamie Brough <jamie@wavey.ai>"]
+authors = ["Infidelity <hi@infidelity.io>"]
 version = "0.1.0"
 edition = "2021"
 autobenches = false
